@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p '/Users/kwadjossanisaackpakpavi/Claude_Projects/Autonomous Arbitrage Commerce Engine \\(AACE\\)/directives/adr')",
+      "Bash(mkdir -p '/Users/kwadjossanisaackpakpavi/Claude_Projects/Autonomous Arbitrage Commerce Engine \\(AACE\\)/directives/spec/features/auth')",
+      "Bash(mkdir -p '/Users/kwadjossanisaackpakpavi/Claude_Projects/Autonomous Arbitrage Commerce Engine \\(AACE\\)/directives/spec/features/product_ingestion')",
+      "Bash(mkdir -p '/Users/kwadjossanisaackpakpavi/Claude_Projects/Autonomous Arbitrage Commerce Engine \\(AACE\\)/directives/spec/features/price_monitoring')",
+      "Bash(mkdir -p '/Users/kwadjossanisaackpakpavi/Claude_Projects/Autonomous Arbitrage Commerce Engine \\(AACE\\)/directives/spec/features/opportunity_scoring')"
+    ]
+  }
+}
