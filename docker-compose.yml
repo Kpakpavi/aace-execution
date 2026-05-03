@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: aace-postgres
+    environment:
+      POSTGRES_DB: aace
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./aace-execution/sql/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aace-api
+    depends_on:
+      - postgres
+    ports:
+      - "8000:8000"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: aace
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      AACE_API_KEY: AOZmWzSfm4ycrvMFMvtvVgttNu3OaDWjlE1HKwSCb848qQgjd-36rEEfO1JQbP8A
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: aace-dashboard
+    depends_on:
+      - api
+    ports:
+      - "8502:8501"
+    environment:
+      AACE_API_KEY: AOZmWzSfm4ycrvMFMvtvVgttNu3OaDWjlE1HKwSCb848qQgjd-36rEEfO1JQbP8A
+      AACE_API_BASE_URL: http://api:8000
+
+volumes:
+  postgres_data:
