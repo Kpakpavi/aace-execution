@@ -1,0 +1,578 @@
+# Pipeline Orchestration Contract
+
+## 1. Purpose
+
+This document is the authoritative contract for the Opportunity Pipeline Orchestrator — the
+coordination layer that sequences and connects the AACE Opportunity Pipeline from input
+receipt through final audit emission.
+
+It defines:
+
+- the pipeline's ordered stage sequence and the workers it coordinates,
+- the rules that govern transitions between stages,
+- how each possible stage result propagates forward or terminates the pipeline,
+- the conditions under which the pipeline halts,
+- how inputs are passed between stages,
+- how the final result is assembled and how the audit record is emitted,
+- what the orchestrator is and is not allowed to do.
+
+This is not an implementation document.
+It does not contain code, pseudocode, or framework-specific instructions.
+It defines the behavioral contract that the orchestration layer must satisfy.
+
+---
+
+## 2. Relationship to Spec Repo
+
+This orchestrator implements the pipeline coordination behavior defined in the following AACE
+spec directives:
+
+- `directives/spec/00_overview.md` — MVP objective and core data flow
+- `directives/spec/06_architecture.md` — three-layer model, pipeline data flow, layer separation rules
+- `directives/spec/12_autonomous_execution_constraints.md` — execution boundary rules, idempotency constraints, layer separation constraints
+- `directives/adr/0005_background_jobs_and_queue.md` — job design rules, retry policy, scheduling rules
+- `directives/spec/features/price_monitoring/` — discrepancy detection rules governing Stage 2
+- `directives/spec/features/opportunity_scoring/` — scoring rules governing Stage 3
+- `directives/spec/features/alerts/` — alert eligibility rules governing Stage 4
+
+In addition, this orchestrator connects the following execution contracts, each of which defines
+the full behavioral contract for its stage. This orchestration contract does not supersede them;
+it governs how they are sequenced and how their outputs are used:
+
+- `INPUT_VALIDATOR_CONTRACT.md` — Stage 1: Input Validation
+- `DISCREPANCY_WORKER_CONTRACT.md` — Stage 2: Discrepancy Detection
+- `SCORING_WORKER_CONTRACT.md` — Stage 3: Opportunity Scoring
+- `ALERT_DECISION_CONTRACT.md` — Stage 4: Alert Decision
+- `OPPORTUNITY_PIPELINE_JOB.md` — canonical stage outcome definitions and result classifications
+
+Business rules flow one direction: spec → stage contracts → this orchestrator.
+This orchestrator must not redefine any rule owned by those contracts or directives.
+
+---
+
+## 3. Pipeline Objective
+
+The Opportunity Pipeline Orchestrator is responsible for executing the ordered sequence of
+deterministic stages that transform a structured input context into a fully classified,
+auditable pipeline result.
+
+Its objective is to:
+
+- accept a single structured input context,
+- invoke each stage in the defined order,
+- pass the output of each stage as the input to the next stage,
+- halt immediately when a terminal stop condition is reached,
+- assemble the complete structured result from all stage outputs,
+- emit an audit record and structured log for every execution, regardless of outcome.
+
+The orchestrator makes no business decisions of its own.
+It routes, sequences, and assembles — it does not evaluate.
+
+Every business decision in this pipeline is made by the stage workers it coordinates.
+The orchestrator applies their outputs; it does not interpret, override, or supplement them.
+
+Orchestration is deterministic.
+Given the same input context and the same configured rule sets, the orchestrator must produce
+the same final result classification on every execution.
+
+---
+
+## 4. Pipeline Scope
+
+### In Scope
+
+This orchestrator coordinates the following pipeline stages, in order:
+
+1. Input Validation
+2. Discrepancy Detection (which includes normalization and eligibility evaluation as internal sub-steps performed within the Discrepancy Worker)
+3. Opportunity Scoring
+4. Alert Decision
+5. Final Result Assembly
+6. Audit and Log Emission
+
+### Out of Scope
+
+This orchestrator does not:
+
+- define the business rules applied within any stage,
+- send notifications or enqueue alert delivery,
+- persist business records — opportunity records, scoring records, alert records, or audit
+  events are written by the downstream persistence layer that consumes the assembled result,
+- implement retry logic — retry invocation is governed by Section 11 and executed at the
+  upstream job layer,
+- fetch or enrich external data,
+- schedule or trigger itself — scheduling is the responsibility of the upstream job layer.
+
+---
+
+## 5. Required Inputs
+
+The orchestrator requires a single structured input context at pipeline entry.
+
+All fields needed by Stage 1 through Stage 4 must be present in this context at entry.
+No field may be fetched, inferred, or enriched by the orchestrator during execution.
+
+**Required fields:**
+
+- `pipeline_execution_id` — a unique, stable identifier for this pipeline run. Generated by
+  the upstream job layer before the orchestrator is invoked. Must not be null or empty.
+- `product_id` — stable product identifier linking to the system of record.
+- `price_observations` — two or more price observations, each including: `source_id`, `price`,
+  `observation_timestamp`.
+- `discrepancy_rule_set` — the spec-defined discrepancy rules to apply in Stage 2.
+- `scoring_factor_set` — the spec-defined scoring factors and weights to apply in Stage 3.
+- `score_range` — the configured minimum and maximum for the scoring range.
+- `normalization_method` — the normalization method for scoring, or null if none.
+- `tie_break_order` — the ordered tie-break criteria for downstream ranking.
+- `alert_threshold` — the minimum score required for alert eligibility in Stage 4.
+- `eligible_opportunity_statuses` — the list of opportunity statuses eligible for alert evaluation.
+- `opportunity_status` — the current status of the opportunity being evaluated.
+- `notification_type` — the notification condition type to evaluate in Stage 4.
+- `freshness_window_seconds` — the spec-defined freshness window for validating observation timestamps.
+- `freshness_reference_timestamp` — an explicit ISO 8601 reference timestamp used for all
+  freshness and scoring calculations across the pipeline. Must be provided by the upstream
+  job layer. Must never be derived from the system clock inside the orchestrator or any stage.
+- `max_retry_count` — the configured maximum retry attempts for transient `PROCESSING_FAILURE`
+  results, provided for the job layer's use.
+
+If a required field is absent, the orchestrator must halt immediately and produce a
+`VALIDATION_FAILURE` result before invoking Stage 1.
+
+---
+
+## 6. Pipeline Stages
+
+The pipeline executes exactly six stages in the fixed order defined below.
+
+Stage ordering is fixed.
+No stage may begin before the previous stage has completed and its output has been captured.
+No stage may be skipped, reordered, or executed concurrently with any other stage.
+
+---
+
+### Stage 1 — Input Validation
+
+**Worker contract**: `INPUT_VALIDATOR_CONTRACT.md`
+
+**Responsibility**: Validate all required input fields for presence, type, value constraints,
+structural relationships, source identifiers, and observation timestamp freshness.
+
+**Input to this stage**: the full pipeline input context provided at pipeline entry.
+
+**Possible outputs and orchestrator transition**:
+
+| Stage 1 Output | Orchestrator Transition |
+|---|---|
+| `VALID` | Proceed to Stage 2. Pass the validated input context forward. |
+| `INVALID` | Terminal stop. Assemble `VALIDATION_FAILURE`. Proceed to Stage 5, then Stage 6. |
+| `PRECONDITION_FAILURE` | Terminal stop. Assemble `PRECONDITION_FAILURE`. Proceed to Stage 5, then Stage 6. |
+
+**Constraint**: Stage 2 must never begin unless Stage 1 returned `VALID`.
+
+---
+
+### Stage 2 — Discrepancy Detection
+
+**Worker contract**: `DISCREPANCY_WORKER_CONTRACT.md`
+
+**Responsibility**: Normalize the validated input context, evaluate discrepancy eligibility,
+and apply the spec-defined discrepancy rules to determine whether a meaningful price
+discrepancy exists across the provided observations.
+
+Normalization and eligibility evaluation are internal sub-steps performed within the Discrepancy
+Worker. The orchestrator does not separately invoke a normalization step or an eligibility step.
+It invokes the Discrepancy Worker, which performs all three sub-steps internally and returns
+a single classified result.
+
+**Input to this stage**: the validated input context from Stage 1, plus `discrepancy_rule_set`
+and `freshness_reference_timestamp` from the pipeline input context.
+
+**Possible outputs and orchestrator transition**:
+
+| Stage 2 Output | Orchestrator Transition |
+|---|---|
+| `DISCREPANCY_DETECTED` | Proceed to Stage 3. Pass the discrepancy result forward. |
+| `NO_DISCREPANCY` | Terminal stop. Assemble `NO_OPPORTUNITY`. Proceed to Stage 5, then Stage 6. |
+| `NO_OP` | Terminal stop. Assemble `NO_OP`. Proceed to Stage 5, then Stage 6. |
+| `PROCESSING_FAILURE` | Terminal stop. Assemble `PROCESSING_FAILURE`. Proceed to Stage 5, then Stage 6. Notify job layer of retry eligibility. |
+
+**Constraint**: Stage 3 must never begin unless Stage 2 returned `DISCREPANCY_DETECTED`.
+
+---
+
+### Stage 3 — Opportunity Scoring
+
+**Worker contract**: `SCORING_WORKER_CONTRACT.md`
+
+**Responsibility**: Apply the spec-defined scoring factors and weights to the confirmed
+discrepancy and produce a single deterministic score with a full factor breakdown.
+
+**Input to this stage**: the `DISCREPANCY_DETECTED` result from Stage 2, plus `scoring_factor_set`,
+`score_range`, `normalization_method`, `tie_break_order`, and `freshness_reference_timestamp`
+from the pipeline input context.
+
+**Possible outputs and orchestrator transition**:
+
+| Stage 3 Output | Orchestrator Transition |
+|---|---|
+| `SCORED_OPPORTUNITY` | Resolve the duplicate check required by Stage 4 (see Section 9, Rule 9.3). Then proceed to Stage 4 with the scored opportunity result and the resolved `duplicate_check_result`. |
+| `NO_SCORE` | Terminal stop. Assemble `NO_OPPORTUNITY`. Proceed to Stage 5, then Stage 6. |
+| `PROCESSING_FAILURE` | Terminal stop. Assemble `PROCESSING_FAILURE`. Proceed to Stage 5, then Stage 6. Notify job layer of retry eligibility. |
+
+**Constraint**: Stage 4 must never begin unless Stage 3 returned `SCORED_OPPORTUNITY`.
+
+---
+
+### Stage 4 — Alert Decision
+
+**Worker contract**: `ALERT_DECISION_CONTRACT.md`
+
+**Responsibility**: Evaluate whether the scored opportunity meets the spec-defined alert
+eligibility conditions and produce a deterministic `ALERT_ELIGIBLE` or `NO_ALERT` decision.
+
+**Input to this stage**: the `SCORED_OPPORTUNITY` result from Stage 3, plus `alert_threshold`,
+`eligible_opportunity_statuses`, `opportunity_status`, `notification_type`, the
+`duplicate_check_result` pre-resolved by the orchestrator (see Section 9, Rule 9.3), and
+`decision_reference_timestamp` which must equal the `freshness_reference_timestamp` carried
+through the pipeline.
+
+**Possible outputs and orchestrator transition**:
+
+| Stage 4 Output | Orchestrator Transition |
+|---|---|
+| `ALERT_ELIGIBLE` | Proceed to Stage 5. Pass all accumulated stage outputs forward. |
+| `NO_ALERT` | Proceed to Stage 5. Pass all accumulated stage outputs forward including the `NO_ALERT` result and its `suppression_reason`. `NO_ALERT` is a valid outcome — it does not halt before result assembly. |
+| `PROCESSING_FAILURE` | Terminal stop. Assemble `PROCESSING_FAILURE`. Proceed to Stage 5, then Stage 6. Notify job layer of retry eligibility. |
+
+**Constraint**: Stage 5 must never begin if Stage 4 returned `PROCESSING_FAILURE`.
+
+---
+
+### Stage 5 — Final Result Assembly
+
+**Responsibility**: Assemble the complete structured pipeline result from all prior stage
+outputs into a single classified result object.
+
+This stage is performed by the orchestrator itself.
+There is no separate stage worker for result assembly.
+The orchestrator consolidates what each stage returned into the canonical result types defined
+in Section 8.
+
+**Input to this stage**: all accumulated stage outputs from Stages 1 through 4.
+
+**Assembly mapping**:
+
+| Accumulated Stage Outputs | Final Result Classification |
+|---|---|
+| Stage 1: `VALID` → Stage 2: `DISCREPANCY_DETECTED` → Stage 3: `SCORED_OPPORTUNITY` → Stage 4: `ALERT_ELIGIBLE` | `OPPORTUNITY_DETECTED` |
+| Stage 1: `VALID` → Stage 2: `DISCREPANCY_DETECTED` → Stage 3: `SCORED_OPPORTUNITY` → Stage 4: `NO_ALERT` | `OPPORTUNITY_SCORED_NO_ALERT` |
+| Stage 1: `VALID` → Stage 2: `NO_DISCREPANCY` | `NO_OPPORTUNITY` |
+| Stage 1: `VALID` → Stage 2: `NO_OP` | `NO_OP` |
+| Stage 1: `VALID` → Stage 2: `DISCREPANCY_DETECTED` → Stage 3: `NO_SCORE` | `NO_OPPORTUNITY` |
+| Stage 1: `INVALID` | `VALIDATION_FAILURE` |
+| Stage 1: `PRECONDITION_FAILURE` | `PRECONDITION_FAILURE` |
+| Any stage: `PROCESSING_FAILURE` | `PROCESSING_FAILURE` |
+
+The assembly stage must not modify, reinterpret, or supplement any stage output.
+It consolidates — it does not evaluate.
+
+---
+
+### Stage 6 — Audit and Log Emission
+
+**Responsibility**: Emit a structured audit record and a structured log entry for this
+pipeline execution.
+
+This stage is performed by the orchestrator itself.
+
+Stage 6 must execute for every pipeline execution, regardless of the final result
+classification. A pipeline that completes Stage 5 but does not emit Stage 6 is not a
+complete execution.
+
+**Input to this stage**: the assembled pipeline result from Stage 5 and the `pipeline_execution_id`.
+
+**Output**: confirmed emission of the audit record and the structured log entry.
+
+If Stage 6 fails to emit the audit record, the pipeline execution must be treated as
+incomplete. This failure must surface as an explicit error and must not be suppressed,
+even if all prior stages succeeded.
+
+---
+
+## 7. Stage Transition Rules
+
+The following rules govern all stage transitions in this pipeline without exception.
+
+1. **Sequential execution only.** No two stages may execute concurrently within a single pipeline run. Each stage must complete fully before the next begins.
+2. **Output capture before transition.** The orchestrator must capture and retain the full structured output of each stage before invoking the next. A stage output must never be consumed in a way that prevents it from appearing in Stage 5 assembly or Stage 6 audit.
+3. **Transition on designated success result only.** A stage may trigger the next stage only if its output matches the specific result that permits continuation (see Section 6). Any other output either halts the pipeline or follows a stop condition path.
+4. **No stage skipping.** Stage 3 cannot be invoked before Stage 2. Stage 4 cannot be invoked before Stage 3. Stage 5 cannot be skipped regardless of outcome. Stage 6 cannot be skipped regardless of outcome. The sequence is fixed.
+5. **Halt-and-proceed to Stages 5 and 6 on stop condition.** When a terminal stop condition is reached, the orchestrator must not invoke any remaining pipeline stage other than Stage 5 and Stage 6.
+6. **No re-execution of completed stages within a run.** Once a stage has completed and its output has been captured, the orchestrator must not reinvoke that stage within the same pipeline run. A retry begins from Stage 1.
+7. **Stage outputs are immutable after capture.** The orchestrator must not modify a stage output after capturing it. All stage outputs pass through unchanged to Stage 5 and Stage 6.
+8. **Orchestrator failure is a `PROCESSING_FAILURE`.** If the orchestrator itself encounters an unhandled error (not within a stage worker), it must produce a `PROCESSING_FAILURE` result with the failure stage identified as `ORCHESTRATOR` and proceed to Stage 6.
+
+---
+
+## 8. Pipeline Result Types
+
+Every execution of this pipeline must produce exactly one of the following classified results.
+
+**OPPORTUNITY_DETECTED**
+A discrepancy was found, scored, and the scored opportunity is alert-eligible.
+Includes: the full detection result, score and factor breakdown, and the `ALERT_ELIGIBLE` decision.
+
+**OPPORTUNITY_SCORED_NO_ALERT**
+A discrepancy was found and scored, but the opportunity did not meet alert eligibility conditions.
+Includes: the full detection result, score and factor breakdown, and the `NO_ALERT` decision
+with `suppression_reason`.
+This is a valid, successful pipeline outcome — not a failure.
+
+**NO_OPPORTUNITY**
+Discrepancy detection ran and found no meaningful discrepancy, or the discrepancy was found
+but was not eligible for scoring under spec-defined conditions.
+Includes: the stage at which the no-result outcome occurred and the reason.
+This is a valid, expected outcome — not a failure.
+
+**NO_OP**
+The input was valid but the context was ineligible for discrepancy detection.
+No discrepancy was evaluated. No opportunity was produced.
+Includes: the eligibility decision and the reason for ineligibility.
+This is a valid, expected outcome — not a failure.
+
+**VALIDATION_FAILURE**
+The input did not pass Stage 1 validation. No downstream stage was invoked.
+Includes: the failing fields, the failure reasons, and the input identity.
+
+**PRECONDITION_FAILURE**
+The input passed Stage 1 validation but a structural precondition was not satisfied.
+No business logic was applied.
+Includes: which precondition failed and why.
+
+**PROCESSING_FAILURE**
+An unexpected or unrecoverable error occurred during a processing stage or within the
+orchestrator itself.
+Includes: the stage where the failure occurred, the failure reason, whether it is retriable,
+and the `pipeline_execution_id`.
+
+All result types must produce a Stage 6 audit record.
+No result type may be returned without a corresponding audit record.
+`VALIDATION_FAILURE`, `PRECONDITION_FAILURE`, `NO_OP`, and `NO_OPPORTUNITY` must be treated
+as clean exits — not errors — in logs and audit records.
+
+---
+
+## 9. Stage Output Passing Rules
+
+The following rules govern how outputs move between stages.
+
+### 9.1 Forward Carry of `pipeline_execution_id`
+
+The `pipeline_execution_id` must be present in the input to every stage and must appear in
+every stage output. It is never modified or regenerated during a pipeline run.
+If a stage output does not carry `pipeline_execution_id`, the orchestrator must treat this
+as a `PROCESSING_FAILURE`.
+
+### 9.2 Accumulated Context
+
+The orchestrator accumulates stage outputs as the pipeline progresses.
+Each stage receives the original pipeline input context plus the outputs of all prior stages
+relevant to its contract.
+
+Explicitly:
+
+- Stage 2 receives: the validated input context from Stage 1, plus `discrepancy_rule_set` and `freshness_reference_timestamp` from the pipeline input context.
+- Stage 3 receives: the `DISCREPANCY_DETECTED` result from Stage 2, plus `scoring_factor_set`, `score_range`, `normalization_method`, `tie_break_order`, and `freshness_reference_timestamp` from the pipeline input context.
+- Stage 4 receives: the `SCORED_OPPORTUNITY` result from Stage 3, plus `alert_threshold`, `eligible_opportunity_statuses`, `opportunity_status`, `notification_type`, the pre-resolved `duplicate_check_result` (see Rule 9.3), and `decision_reference_timestamp` (equal to `freshness_reference_timestamp`).
+- Stage 5 receives: all stage outputs captured during the run.
+- Stage 6 receives: the assembled result from Stage 5 and `pipeline_execution_id`.
+
+No stage may receive data from a stage that has not yet executed.
+No stage may receive data not present in the pipeline input context or in a prior stage output.
+
+### 9.3 Duplicate Check Resolution Before Stage 4
+
+Before invoking Stage 4, the orchestrator must resolve whether a prior alert already exists
+for the current opportunity and `notification_type`.
+
+This resolution must produce a `duplicate_check_result` with one of exactly two values:
+`NO_PRIOR_ALERT` or `PRIOR_ALERT_EXISTS`.
+
+The orchestrator provides this pre-resolved value to Stage 4 as an explicit input field.
+Stage 4 applies the result — it does not perform the lookup.
+
+If the duplicate check resolution itself fails, the orchestrator must halt and produce a
+`PROCESSING_FAILURE` before invoking Stage 4.
+
+### 9.4 No Data Enrichment Between Stages
+
+The orchestrator must not add, modify, or remove any field from a stage output as it passes
+the output forward to the next stage. The orchestrator routes outputs — it does not transform
+them. The only orchestrator-generated values that travel through the pipeline are
+`pipeline_execution_id` (provided by the job layer before Stage 1) and `duplicate_check_result`
+(resolved by the orchestrator before Stage 4).
+
+### 9.5 Timestamp Consistency
+
+The `freshness_reference_timestamp` provided at pipeline entry must be passed unchanged to
+Stage 2, Stage 3, and Stage 4. No stage may substitute or replace this timestamp.
+The orchestrator must never read the system clock to produce or supplement this value.
+
+---
+
+## 10. Stop Conditions
+
+The following conditions terminate further stage execution before Stage 5 and Stage 6.
+
+When a stop condition is reached, the orchestrator must:
+1. record the stop reason and the stage at which it occurred,
+2. proceed to Stage 5 to assemble the appropriate classified result,
+3. proceed to Stage 6 to emit the audit record and log,
+4. return the assembled result to the caller.
+
+No pipeline stage after the stop point — other than Stage 5 and Stage 6 — may execute.
+
+| Condition | Stage | Stop Behavior |
+|---|---|---|
+| Stage 1 returns `INVALID` | Stage 1 | Halt. Assemble `VALIDATION_FAILURE`. Emit audit. |
+| Stage 1 returns `PRECONDITION_FAILURE` | Stage 1 | Halt. Assemble `PRECONDITION_FAILURE`. Emit audit. |
+| Stage 2 returns `NO_DISCREPANCY` | Stage 2 | Halt. Assemble `NO_OPPORTUNITY`. Emit audit. |
+| Stage 2 returns `NO_OP` | Stage 2 | Halt. Assemble `NO_OP`. Emit audit. |
+| Stage 2 returns `PROCESSING_FAILURE` | Stage 2 | Halt. Assemble `PROCESSING_FAILURE`. Emit audit. Notify job layer of retry eligibility. |
+| Stage 3 returns `NO_SCORE` | Stage 3 | Halt. Assemble `NO_OPPORTUNITY`. Emit audit. |
+| Stage 3 returns `PROCESSING_FAILURE` | Stage 3 | Halt. Assemble `PROCESSING_FAILURE`. Emit audit. Notify job layer of retry eligibility. |
+| Duplicate check resolution fails | Between Stage 3 and 4 | Halt. Assemble `PROCESSING_FAILURE`. Emit audit. Notify job layer of retry eligibility. |
+| Stage 4 returns `PROCESSING_FAILURE` | Stage 4 | Halt. Assemble `PROCESSING_FAILURE`. Emit audit. Notify job layer of retry eligibility. |
+| Orchestrator internal error | Any | Produce `PROCESSING_FAILURE` (stage: `ORCHESTRATOR`). Emit audit. |
+
+**`NO_ALERT` from Stage 4 is not a stop condition.**
+It is a valid result that continues to Stage 5 and Stage 6 as `OPPORTUNITY_SCORED_NO_ALERT`.
+
+`VALIDATION_FAILURE`, `PRECONDITION_FAILURE`, `NO_OP`, and `NO_OPPORTUNITY` are valid
+expected outcomes. They must not be treated or logged as errors.
+
+---
+
+## 11. Retry Rules
+
+Retry behavior in this pipeline is governed by the following rules.
+The orchestrator does not implement retries internally.
+Retry invocation is the responsibility of the upstream job layer.
+
+1. Only `PROCESSING_FAILURE` results with `retriable: true` in their stage output are eligible for retry by the job layer.
+2. `VALIDATION_FAILURE` and `PRECONDITION_FAILURE` results must never be retried automatically. The input must be corrected before resubmission.
+3. `NO_OP`, `NO_OPPORTUNITY`, and `OPPORTUNITY_SCORED_NO_ALERT` results must never be retried — they are correct, expected outcomes.
+4. The maximum retry count is defined by `max_retry_count` in the pipeline input context. It must not be hardcoded in the orchestrator.
+5. Each retry must re-execute the full pipeline from Stage 1. The orchestrator does not resume from the stage that failed.
+6. Each retry must carry the same `pipeline_execution_id` as the original attempt. The `pipeline_execution_id` must not be regenerated on retry.
+7. Each retry attempt must produce its own Stage 6 audit record. A retry must not suppress audit emission because a prior attempt already emitted one.
+8. After the retry limit is exceeded, the job layer must escalate the failure as terminal. The orchestrator does not enforce the retry limit — it executes a single pipeline run per invocation.
+9. Retried executions must not produce duplicate opportunity records, scoring records, or alert records. Idempotency guards at the persistence layer enforce this; the orchestrator supports it by carrying the same `pipeline_execution_id` throughout.
+
+---
+
+## 12. Idempotency Rules
+
+1. Running this pipeline multiple times on the same input identity with the same `pipeline_execution_id` must not create duplicate opportunity records, scoring records, or alert decision records.
+2. Each pipeline run carries a `pipeline_execution_id` assigned by the upstream job layer before the orchestrator is invoked. This identifier is the deduplication key at all downstream persistence points.
+3. If a pipeline for a given `pipeline_execution_id` has already reached a finalized state (`OPPORTUNITY_DETECTED`, `OPPORTUNITY_SCORED_NO_ALERT`, `NO_OPPORTUNITY`, `NO_OP`), the upstream job layer's idempotency guard must detect this and exit before re-invoking the orchestrator. This guard is the job layer's responsibility, not the orchestrator's.
+4. If a pipeline for a given `pipeline_execution_id` previously produced a `PROCESSING_FAILURE`, a rerun is permitted. The orchestrator executes from Stage 1 as a clean run.
+5. The orchestrator is stateless between runs. It does not track its own prior execution state. All idempotency enforcement is performed by the job layer (entry guard) and the persistence layer (unique constraint enforcement on `pipeline_execution_id`).
+6. Idempotency behavior must be verified by tests that assert running the pipeline twice on the same input with the same `pipeline_execution_id` produces the same final result classification and does not increase record counts at the persistence layer.
+
+---
+
+## 13. Logging and Audit Requirements
+
+### Logging Requirements
+
+The orchestrator must emit a structured log entry at each of the following points:
+
+- **Pipeline start**: `pipeline_execution_id`, `product_id`, number of price observations, `freshness_reference_timestamp`.
+- **Each stage start**: stage name, `pipeline_execution_id`.
+- **Each stage completion**: stage name, output classification, elapsed time for that stage.
+- **Each stop condition reached**: stage name, stop reason, result classification.
+- **Duplicate check resolution** (before Stage 4): `duplicate_check_result` value, or failure reason if resolution failed.
+- **Pipeline end**: final result classification, total elapsed time, `pipeline_execution_id`.
+- **Any failure**: stage name, failure reason, `retriable` status.
+
+Logs must be structured and machine-readable.
+Logs must never include secrets, credentials, tokens, or raw external API payloads.
+Logs must never log full price observation arrays at INFO level — `product_id` and observation
+count are sufficient for traceability at that level.
+
+### Audit Requirements
+
+- An audit record must be emitted in Stage 6 for every pipeline execution, regardless of result classification.
+- The audit record must include: `pipeline_execution_id`, `product_id`, final result classification, result timestamp, and a stage-level outcome summary listing each stage that executed and its output classification.
+- For `OPPORTUNITY_DETECTED` and `OPPORTUNITY_SCORED_NO_ALERT` results, the audit record must also include: the discrepancy rule applied, the score, the scoring factor breakdown, and the alert eligibility decision.
+- For `PROCESSING_FAILURE` results, the audit record must include: the stage of failure and the failure classification.
+- For `NO_OP` and `NO_OPPORTUNITY` results, the audit record must include: the stage at which the pipeline exited early and the reason.
+- A pipeline execution that reaches Stage 5 but fails to emit a Stage 6 audit record must be treated as incomplete. This must not be reported as successful.
+
+---
+
+## 14. What This Pipeline Must NOT Do
+
+The following are explicitly forbidden in this orchestrator:
+
+- **Redefine business rules.** Discrepancy thresholds, scoring factors, alert thresholds, eligibility criteria, and validation constraints are owned by the spec and implemented by the stage workers. The orchestrator applies stage outputs — it does not evaluate them.
+- **Apply business logic between stages.** Between stages, the orchestrator may only route outputs, pass them forward, and resolve the pre-Stage-4 duplicate check. It must not evaluate, transform, or supplement stage outputs.
+- **Send or schedule notifications.** Stage 4 produces an eligibility decision. Delivering a notification is a downstream concern outside this pipeline.
+- **Persist business records directly.** The orchestrator assembles a structured result (Stage 5) and emits an audit record (Stage 6). Writing opportunity records, scoring records, or alert records to the system of record is the responsibility of the downstream persistence layer.
+- **Fetch or enrich external data.** All data needed by every stage must be present in the pipeline input context at entry. The orchestrator makes no external calls.
+- **Read the system clock.** All timestamps in this pipeline originate from the `freshness_reference_timestamp` provided at pipeline entry. The orchestrator must never substitute or supplement this value with a system clock reading.
+- **Mix stage responsibilities.** The orchestrator must not perform validation logic, detection logic, scoring logic, or alert decision logic. Each belongs exclusively to its designated stage worker.
+- **Call an AI model at runtime.** No AI model may be invoked within the orchestrator to make routing decisions, interpret stage outputs, or classify results.
+- **Invoke stages out of order.** The stage sequence defined in Section 6 is fixed. No deviation is permitted.
+- **Proceed past a terminal stop condition.** If a stop condition is reached, no stage after the stop point — other than Stage 5 and Stage 6 — may execute.
+- **Skip Stage 5 or Stage 6.** Result assembly and audit emission are mandatory for every execution. The orchestrator must not return a result before both stages complete.
+- **Generate a new `pipeline_execution_id` on retry.** The `pipeline_execution_id` is assigned by the upstream job layer before invocation. It must remain unchanged across retries.
+- **Treat `NO_ALERT`, `NO_OPPORTUNITY`, or `NO_OP` as errors.** These are valid, expected outcomes. They must be handled and logged as successful pipeline completions with clean exits, not as failures.
+- **Swallow exceptions.** Any unhandled error within the orchestrator itself must surface as a `PROCESSING_FAILURE` with `failure_stage` identified as `ORCHESTRATOR`.
+
+---
+
+## 15. Success Criteria
+
+This pipeline is successful when:
+
+1. A valid input with a detectable discrepancy, a scoreable opportunity, and an alert-eligible score produces `OPPORTUNITY_DETECTED` containing the full detection result, score breakdown, and `ALERT_ELIGIBLE` decision.
+2. A valid input with a detectable discrepancy and a scoreable opportunity that does not meet the alert threshold produces `OPPORTUNITY_SCORED_NO_ALERT` containing the full detection result, score breakdown, and `NO_ALERT` decision with `suppression_reason`.
+3. A valid input where discrepancy detection finds no discrepancy produces `NO_OPPORTUNITY` with the rule applied and comparison values recorded.
+4. A valid input where the context is ineligible for detection produces `NO_OP` with the eligibility reason recorded.
+5. An invalid input produces `VALIDATION_FAILURE` identifying the failing fields and reasons without invoking any downstream stage.
+6. An unsatisfied structural precondition produces `PRECONDITION_FAILURE` without invoking any pipeline processing stage.
+7. A transient `PROCESSING_FAILURE` at any stage halts the pipeline, emits a Stage 6 audit record, and notifies the job layer that the result is retriable.
+8. All seven result classifications — `OPPORTUNITY_DETECTED`, `OPPORTUNITY_SCORED_NO_ALERT`, `NO_OPPORTUNITY`, `NO_OP`, `VALIDATION_FAILURE`, `PRECONDITION_FAILURE`, `PROCESSING_FAILURE` — are covered by integration tests with deterministic inputs.
+9. Running the pipeline twice on the same input with the same `pipeline_execution_id` produces the same final result classification and does not increase record counts at the persistence layer.
+10. Every pipeline execution produces a Stage 6 audit record, including `NO_OP`, `VALIDATION_FAILURE`, `PRECONDITION_FAILURE`, and `PROCESSING_FAILURE` outcomes.
+11. No pipeline execution completes Stage 5 without completing Stage 6.
+12. Every `OPPORTUNITY_DETECTED` and `OPPORTUNITY_SCORED_NO_ALERT` result is fully traceable to its source observations, the discrepancy rule applied, and the scoring factors used.
+13. No secrets appear in any log output or committed configuration file.
+14. The pipeline runs fully in a local development environment without production credentials or infrastructure.
+15. A reviewer with no prior context can trace any pipeline execution from input to final result using the assembled Stage 5 result, the Stage 6 audit record, and the stage contracts alone.
+
+---
+
+## 16. Non-Acceptance Conditions
+
+This pipeline is not acceptable if any of the following are true:
+
+- Any stage executes after a terminal stop condition has been reached.
+- Stage 5 or Stage 6 is skipped for any pipeline execution, including `NO_OP`, `VALIDATION_FAILURE`, and `PRECONDITION_FAILURE` outcomes.
+- A business rule is defined or adjusted within the orchestrator rather than loaded from configuration and applied by a stage worker.
+- An AI model is called at any point within the orchestrator to influence routing, result classification, or any other decision.
+- The system clock is read within the orchestrator to supply or replace the `freshness_reference_timestamp`.
+- The `pipeline_execution_id` is regenerated during a retry rather than carried unchanged from the original invocation.
+- A `PROCESSING_FAILURE` result does not identify the stage where the failure occurred and whether it is retriable.
+- Running the pipeline twice on the same input with the same `pipeline_execution_id` produces duplicate records at the persistence layer.
+- A `NO_ALERT` result from Stage 4 causes the pipeline to skip Stage 5 or Stage 6.
+- `NO_OP`, `NO_OPPORTUNITY`, or `NO_ALERT` outcomes are logged or classified as errors.
+- Any stage output is modified by the orchestrator after it is captured.
+- The duplicate check resolution is performed inside Stage 4 rather than provided as a pre-resolved input by the orchestrator before Stage 4 is invoked.
+- An `OPPORTUNITY_DETECTED` or `OPPORTUNITY_SCORED_NO_ALERT` result cannot be traced to its source observations, the discrepancy rule applied, and the scoring factors used.
+- Integration tests do not cover all seven result classifications.
+- Any committed file contains a secret, token, API key, or credential.
+- The orchestrator invokes stages in an order other than that defined in Section 6.
+- A pipeline execution that fails at Stage 6 is reported as successful.

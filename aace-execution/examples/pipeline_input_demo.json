@@ -1,0 +1,62 @@
+{
+  "pipeline_execution_id": "pipeline-demo-0001",
+  "product_id": "product-demo-0001",
+  "product_name": "Demo Product",
+  "freshness_reference_timestamp": "2026-04-15T12:00:00+00:00",
+  "alert_threshold": 0.5,
+  "opportunity_status": "ACTIVE",
+  "eligible_opportunity_statuses": ["ACTIVE"],
+  "notification_type": "EMAIL",
+  "discrepancy_rule_set": {
+    "rule_id": "rule-demo-001",
+    "threshold_method": "ABSOLUTE",
+    "absolute_threshold": 1.0
+  },
+  "scoring_factor_set": {
+    "scoring_factors": [
+      {
+        "factor_name": "price_difference",
+        "factor_type": "absolute_difference",
+        "weight": 1.0
+      }
+    ],
+    "score_range": {"min": 0.0, "max": 100.0},
+    "normalization_method": null,
+    "tie_break_order": []
+  },
+  "listings": [
+    {
+      "listing_id": "listing-a",
+      "source": "source_a",
+      "external_id": "ext-a",
+      "price": 100.0,
+      "product_ref": "product-demo-0001"
+    },
+    {
+      "listing_id": "listing-b",
+      "source": "source_b",
+      "external_id": "ext-b",
+      "price": 110.0,
+      "product_ref": "product-demo-0001"
+    }
+  ],
+  "observations": [
+    {
+      "observation_id": "obs-a",
+      "listing_ref": "listing-a",
+      "source": "source_a",
+      "observed_price": 100.0,
+      "normalized_price": 100.0,
+      "observed_at": "2026-04-15T12:00:00+00:00"
+    },
+    {
+      "observation_id": "obs-b",
+      "listing_ref": "listing-b",
+      "source": "source_b",
+      "observed_price": 110.0,
+      "normalized_price": 110.0,
+      "observed_at": "2026-04-15T12:00:00+00:00"
+    }
+  ],
+  "duplicate_check_result": "NO_PRIOR_ALERT"
+}
