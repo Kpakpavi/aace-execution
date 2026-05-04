@@ -27,7 +27,7 @@ services:
       POSTGRES_DB: aace
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      AACE_API_KEY: AOZmWzSfm4ycrvMFMvtvVgttNu3OaDWjlE1HKwSCb848qQgjd-36rEEfO1JQbP8A
+      AACE_API_KEY: ${AACE_API_KEY:?AACE_API_KEY must be set in .env}
 
   dashboard:
     build:
@@ -39,7 +39,7 @@ services:
     ports:
       - "8502:8501"
     environment:
-      AACE_API_KEY: AOZmWzSfm4ycrvMFMvtvVgttNu3OaDWjlE1HKwSCb848qQgjd-36rEEfO1JQbP8A
+      AACE_API_KEY: ${AACE_API_KEY:?AACE_API_KEY must be set in .env}
       AACE_API_BASE_URL: http://api:8000
 
 volumes:
