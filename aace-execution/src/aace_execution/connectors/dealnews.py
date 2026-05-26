@@ -1,14 +1,18 @@
-"""Slickdeals frontpage RSS connector.
+"""DealNews Top-Deals RSS connector.
 
-Slickdeals publishes a public RSS feed of community-curated deals on the
-frontpage — no API key, no rate-limit auth, fully free. Each feed item
-has a title (containing the deal price), a link to the discussion thread,
-a guid, and a publication time.
+DealNews publishes RSS feeds of curated bargains across categories.
+No auth, no API key — same lightweight contract as the Slickdeals
+connector. We pull the *Top Deals* feed by default and emit one
+``NormalizedListing`` per item whose title contains a parseable USD
+price. Items without a price (giveaways, contests) are skipped.
 
-This connector pulls that feed and emits one ``NormalizedListing`` per
-item that has a parseable price. Items without a price (free samples,
-giveaways, etc.) are skipped — they can't enter a discrepancy-based
-pipeline.
+If the default URL changes, override via the ``rss_url`` constructor
+argument. Official DealNews RSS endpoints (per
+https://www.dealnews.com/pages/rss.html, verified 2026-05):
+
+    - https://www.dealnews.com/?rss=1&sort=time      (most recent — default)
+    - https://www.dealnews.com/?rss=1&sort=hotness   (most popular)
+    - https://www.dealnews.com/f1682/Staff-Pick/?rss=1  (editors' picks)
 """
 
 from __future__ import annotations
@@ -27,19 +31,16 @@ from aace_execution.connectors.base import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_RSS_URL = (
-    "https://slickdeals.net/newsearch.php"
-    "?mode=frontpage&searcharea=deals&searchin=first&rss=1"
-)
-"""Public Slickdeals frontpage RSS feed. Free, no auth."""
+DEFAULT_RSS_URL = "https://www.dealnews.com/?rss=1&sort=time"
+"""DealNews 'Most Recent Deals' RSS feed (per official RSS docs)."""
 
 _USER_AGENT = "AACE/0.1 (+https://github.com/Kpakpavi/aace-execution)"
 
 
-class SlickdealsConnector(BaseConnector):
-    """Pulls Slickdeals frontpage RSS and emits priced listings."""
+class DealNewsConnector(BaseConnector):
+    """Pulls DealNews Top-Deals RSS and emits priced listings."""
 
-    name = "slickdeals"
+    name = "dealnews"
 
     def __init__(
         self,
@@ -64,15 +65,14 @@ class SlickdealsConnector(BaseConnector):
             import feedparser
         except ImportError as exc:
             raise ConnectorError(
-                "feedparser is required to use SlickdealsConnector "
+                "feedparser is required to use DealNewsConnector "
                 "(add 'feedparser' to your dependencies)"
             ) from exc
 
         feed = feedparser.parse(feed_text)
         if getattr(feed, "bozo", 0) and not feed.entries:
-            # Malformed and no usable entries — treat as fetch failure.
             raise ConnectorError(
-                f"slickdeals RSS feed at {self._rss_url} is unparseable"
+                f"dealnews RSS feed at {self._rss_url} is unparseable"
             )
 
         now = datetime.now(timezone.utc)
@@ -107,8 +107,13 @@ class SlickdealsConnector(BaseConnector):
     def normalize(self, raw: RawListing) -> NormalizedListing | None:
         price = _extract_price(raw.title)
         if price is None:
+            # Many DealNews items put the price in the description, not
+            # the title — try summary as fallback.
+            summary = (raw.raw_payload or {}).get("summary", "") or ""
+            price = _extract_price(summary)
+        if price is None:
             logger.debug(
-                "slickdeals_skip_no_price",
+                "dealnews_skip_no_price",
                 extra={"external_id": raw.source_external_id, "title": raw.title},
             )
             return None
@@ -146,18 +151,19 @@ class SlickdealsConnector(BaseConnector):
             import httpx
         except ImportError as exc:
             raise ConnectorError(
-                "httpx is required to use SlickdealsConnector "
+                "httpx is required to use DealNewsConnector "
                 "(add 'httpx' to your dependencies)"
             ) from exc
         try:
             with httpx.Client(
                 timeout=self._timeout,
                 headers={"User-Agent": _USER_AGENT, "Accept": "application/rss+xml"},
+                follow_redirects=True,
             ) as client:
                 resp = client.get(url)
                 resp.raise_for_status()
                 return resp.text
         except httpx.HTTPError as exc:
             raise ConnectorError(
-                f"slickdeals RSS fetch failed: {type(exc).__name__}: {exc}"
+                f"dealnews RSS fetch failed: {type(exc).__name__}: {exc}"
             ) from exc
