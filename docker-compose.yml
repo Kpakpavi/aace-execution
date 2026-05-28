@@ -2,21 +2,24 @@ services:
   postgres:
     image: postgres:17
     container_name: aace-postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: aace
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-aace}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     ports:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./aace-execution/sql/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      - ./aace-execution/sql/webhook_deliveries.sql:/docker-entrypoint-initdb.d/002_webhook_deliveries.sql:ro
 
   api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: aace-api
+    restart: unless-stopped
     depends_on:
       - postgres
     ports:
@@ -24,9 +27,9 @@ services:
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      POSTGRES_DB: aace
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-aace}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       AACE_API_KEY: ${AACE_API_KEY:?AACE_API_KEY must be set in .env}
 
   dashboard:
@@ -34,6 +37,7 @@ services:
       context: ./dashboard
       dockerfile: Dockerfile
     container_name: aace-dashboard
+    restart: unless-stopped
     depends_on:
       - api
     ports:
@@ -41,6 +45,24 @@ services:
     environment:
       AACE_API_KEY: ${AACE_API_KEY:?AACE_API_KEY must be set in .env}
       AACE_API_BASE_URL: http://api:8000
+
+  # v0.1.0 production worker — runs the fetch -> match -> score -> webhook
+  # loop on the scheduler interval. This is the service that "earns".
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aace-worker
+    restart: unless-stopped
+    command: ["uv", "run", "python", "-m", "aace_execution.worker"]
+    environment:
+      AGENT_WEBHOOK_URL: ${AGENT_WEBHOOK_URL:?AGENT_WEBHOOK_URL must be set in .env}
+      AGENT_WEBHOOK_SECRET: ${AGENT_WEBHOOK_SECRET:?AGENT_WEBHOOK_SECRET must be set in .env}
+      WORKER_INTERVAL_MINUTES: ${WORKER_INTERVAL_MINUTES:-30}
+      SCORER_MIN_ABS_SPREAD: ${SCORER_MIN_ABS_SPREAD:-5.0}
+      SCORER_MIN_PCT_SPREAD: ${SCORER_MIN_PCT_SPREAD:-0.05}
+      SCORER_PCT_MULTIPLIER: ${SCORER_PCT_MULTIPLIER:-2.0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
 volumes:
   postgres_data:
