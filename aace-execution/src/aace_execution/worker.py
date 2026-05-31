@@ -33,7 +33,7 @@ import signal
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Sequence
+from typing import Any, Sequence
 
 from aace_execution.connectors.base import (
     BaseConnector,
@@ -93,6 +93,7 @@ class Worker:
         scorer: OpportunityScorer,
         webhook_client: AgentWebhookClient,
         similarity_threshold: float = 0.6,
+        opportunity_writer: Any = None,
     ) -> None:
         if not connectors:
             raise ValueError("at least one connector is required")
@@ -100,6 +101,7 @@ class Worker:
         self._scorer = scorer
         self._webhook = webhook_client
         self._similarity_threshold = similarity_threshold
+        self._opportunity_writer = opportunity_writer
 
     def run_once(self) -> WorkerRunResult:
         """One full tick. Never raises — errors are captured in the result."""
@@ -150,6 +152,9 @@ class Worker:
             try:
                 result = self._webhook.send(payload)
                 delivery_results.append(result)
+                # Persist for the dashboard's "Live worker output" panel.
+                if self._opportunity_writer is not None:
+                    self._opportunity_writer.write(opp, result)
             except Exception as exc:
                 # Webhook client should never raise — but defensive.
                 logger.exception(
@@ -272,11 +277,28 @@ def _build_default_worker() -> Worker:
         os.environ.get("MATCHER_SIMILARITY_THRESHOLD", "0.6")
     )
 
+    # Optional dashboard wiring: if Postgres env vars are set, persist
+    # each scored opportunity so the Streamlit dashboard can show it.
+    opportunity_writer = None
+    if os.environ.get("POSTGRES_HOST"):
+        try:
+            from aace_execution.persistence.db import connect
+            from aace_execution.persistence.worker_opportunity_writer import (
+                WorkerOpportunityWriter,
+            )
+            opportunity_writer = WorkerOpportunityWriter(connect())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "worker_opportunity_writer_disabled",
+                extra={"error": f"{type(exc).__name__}: {exc}"},
+            )
+
     return Worker(
         connectors=connectors,
         scorer=scorer,
         webhook_client=webhook_client,
         similarity_threshold=similarity_threshold,
+        opportunity_writer=opportunity_writer,
     )
 
 

@@ -100,6 +100,56 @@ st.markdown(
 )
 st.divider()
 
+# ---------------------------------------------------------------------------
+# Live worker output (v0.1.0 scheduled worker)
+# ---------------------------------------------------------------------------
+
+
+def fetch_worker_opportunities(limit: int = 25):
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/worker-opportunities",
+            params={"limit": limit},
+            headers={"X-API-Key": os.environ.get("AACE_API_KEY", "")},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json(), None
+    except requests.RequestException as exc:
+        return None, str(exc)
+
+
+st.header("Live Worker Output")
+st.caption(
+    "Most recent opportunities the scheduled worker scored and shipped to "
+    "the AI agent. Newest first."
+)
+worker_opps, worker_err = fetch_worker_opportunities(limit=25)
+if worker_err:
+    st.error(f"Failed to load worker opportunities: {worker_err}")
+elif not worker_opps:
+    st.info("No worker opportunities yet. Once the worker ships its first deal, it'll appear here.")
+else:
+    rows = []
+    for opp in worker_opps:
+        rows.append({
+            "Detected": format_timestamp(opp.get("detected_at")),
+            "Product": opp.get("product_key", ""),
+            "Sources": opp.get("sources", ""),
+            "Min $": opp.get("min_price"),
+            "Max $": opp.get("max_price"),
+            "Spread $": opp.get("absolute_spread"),
+            "Spread %": (
+                round(opp.get("percent_spread", 0) * 100, 1)
+                if opp.get("percent_spread") is not None
+                else None
+            ),
+            "Score": format_score(opp.get("score")),
+            "Webhook": opp.get("delivery_status", ""),
+        })
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+st.divider()
+
 st.header("Opportunity Summary")
 st.caption("High-level metrics across all detected opportunities.")
 

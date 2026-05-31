@@ -692,6 +692,85 @@ def run_pipeline(request: RunPipelineRequest) -> RunPipelineResponse:
         )
 
 
+_WORKER_OPPORTUNITY_COLUMNS = (
+    "opportunity_id",
+    "product_key",
+    "sources",
+    "source_count",
+    "min_price",
+    "max_price",
+    "absolute_spread",
+    "percent_spread",
+    "score",
+    "delivery_status",
+    "detected_at",
+)
+
+
+@app.get(
+    "/worker-opportunities",
+    summary="Live worker opportunities (v0.1.0 worker output)",
+    description=(
+        "List the most recent opportunities the scheduled worker scored "
+        "and shipped to the AI agent. Newest first."
+    ),
+)
+def list_worker_opportunities(
+    limit: int = Query(50, ge=1, le=500),
+    min_score: float | None = Query(None),
+) -> list[dict]:
+    try:
+        sql = (
+            "SELECT opportunity_id, product_key, sources, source_count, "
+            "min_price, max_price, absolute_spread, percent_spread, "
+            "score, delivery_status, detected_at "
+            "FROM worker_opportunities"
+        )
+        params: list[object] = []
+        if min_score is not None:
+            sql += " WHERE score >= %s"
+            params.append(min_score)
+        sql += " ORDER BY detected_at DESC LIMIT %s"
+        params.append(limit)
+
+        connection = connect()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, tuple(params))
+                rows = cursor.fetchall()
+        finally:
+            connection.close()
+
+        records: list[dict] = []
+        for row in rows:
+            record = dict(zip(_WORKER_OPPORTUNITY_COLUMNS, row))
+            for field in (
+                "min_price",
+                "max_price",
+                "absolute_spread",
+                "percent_spread",
+                "score",
+            ):
+                value = record.get(field)
+                if isinstance(value, Decimal):
+                    record[field] = float(value)
+            if record["detected_at"] is not None:
+                record["detected_at"] = record["detected_at"].isoformat()
+            records.append(record)
+        return records
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("list_worker_opportunities_internal_error")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "detail": "Worker opportunities lookup failed",
+            },
+        )
+
+
 @app.get(
     "/docs/usage",
     summary="API usage documentation",

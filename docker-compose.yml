@@ -13,6 +13,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./aace-execution/sql/schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
       - ./aace-execution/sql/webhook_deliveries.sql:/docker-entrypoint-initdb.d/002_webhook_deliveries.sql:ro
+      - ./aace-execution/sql/worker_opportunities.sql:/docker-entrypoint-initdb.d/003_worker_opportunities.sql:ro
 
   api:
     build:
@@ -64,6 +65,13 @@ services:
       SCORER_PCT_MULTIPLIER: ${SCORER_PCT_MULTIPLIER:-2.0}
       MATCHER_SIMILARITY_THRESHOLD: ${MATCHER_SIMILARITY_THRESHOLD:-0.6}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-aace}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    depends_on:
+      - postgres
 
 volumes:
   postgres_data:
