@@ -10,10 +10,15 @@ from datetime import datetime, timezone
 
 import pytest
 
+from aace_execution.connectors._helpers import (
+    _jaccard_similarity,
+    _tokenize_title,
+)
 from aace_execution.connectors.base import NormalizedListing
 from aace_execution.pipeline.cross_source_matcher import (
     MatchGroup,
     match_cross_source,
+    match_cross_source_by_tokens,
 )
 
 
@@ -345,3 +350,257 @@ class TestRealisticPipeline:
         assert len(groups) == 1
         assert groups[0].product_key == "shared macbook air m3"
         assert groups[0].source_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Token helpers (_tokenize_title, _jaccard_similarity)
+# ---------------------------------------------------------------------------
+
+
+def _mk_titled(
+    source: str,
+    listing_id_suffix: str,
+    title: str,
+    *,
+    price: float = 100.0,
+) -> NormalizedListing:
+    """Like _mk_listing but with an explicit title (and weak product_key)."""
+    return NormalizedListing(
+        source=source,
+        listing_id=f"{source}:{listing_id_suffix}",
+        external_id=listing_id_suffix,
+        product_key="unused",
+        title=title,
+        url=f"https://{source}.example.com/{listing_id_suffix}",
+        price=price,
+        currency="USD",
+        observed_at=_FIXED_OBSERVED_AT,
+    )
+
+
+class TestTokenizeTitle:
+    def test_empty_title_returns_empty_set(self):
+        assert _tokenize_title("") == frozenset()
+
+    def test_lowercases_and_drops_stopwords(self):
+        tokens = _tokenize_title("Apple MacBook Air M3 256GB")
+        assert tokens == frozenset({"apple", "macbook", "air", "m3", "256gb"})
+
+    def test_strips_prices(self):
+        tokens = _tokenize_title('MacBook Air M3 256GB $799 + Free Shipping')
+        assert "799" not in tokens
+        assert "macbook" in tokens
+
+    def test_strips_was_clause(self):
+        tokens = _tokenize_title('Headphones $49.99 (was $129)')
+        assert "129" not in tokens
+        assert "headphones" in tokens
+
+    def test_strips_parenthetical_asides(self):
+        tokens = _tokenize_title('Apple iPad (Early 2025, Silver)')
+        assert "early" not in tokens
+        assert "silver" not in tokens
+        assert "ipad" in tokens
+
+    def test_two_variants_of_same_title_produce_identical_tokens(self):
+        """The whole point of this helper — wording shouldn't matter."""
+        a = _tokenize_title('Apple MacBook Air M3 256GB $799 + Free Shipping')
+        b = _tokenize_title('Apple MacBook Air M3 256GB for $799 free shipping')
+        assert a == b
+
+    def test_short_tokens_filtered(self):
+        # Single chars dropped (length < 2 filter)
+        tokens = _tokenize_title("a b cd ef")
+        assert "a" not in tokens
+        assert "b" not in tokens
+        assert "cd" in tokens
+        assert "ef" in tokens
+
+
+class TestJaccardSimilarity:
+    def test_identical_sets_yield_one(self):
+        s = frozenset({"a", "b", "c"})
+        assert _jaccard_similarity(s, s) == 1.0
+
+    def test_disjoint_sets_yield_zero(self):
+        a = frozenset({"a", "b"})
+        b = frozenset({"c", "d"})
+        assert _jaccard_similarity(a, b) == 0.0
+
+    def test_both_empty_yields_zero(self):
+        assert _jaccard_similarity(frozenset(), frozenset()) == 0.0
+
+    def test_one_empty_yields_zero(self):
+        assert _jaccard_similarity(frozenset({"a"}), frozenset()) == 0.0
+
+    def test_known_overlap(self):
+        # 2 shared / 4 union -> 0.5
+        a = frozenset({"x", "y", "z"})
+        b = frozenset({"y", "z", "w"})
+        assert _jaccard_similarity(a, b) == 0.5
+
+
+# ---------------------------------------------------------------------------
+# match_cross_source_by_tokens — empty / trivial inputs
+# ---------------------------------------------------------------------------
+
+
+class TestTokenMatcherEmptyAndTrivial:
+    def test_empty_input_returns_empty(self):
+        assert match_cross_source_by_tokens([]) == []
+
+    def test_listings_with_empty_tokens_dropped(self):
+        # A title with only stopwords + prices produces no tokens.
+        listings = [
+            _mk_titled("a", "1", "$10 for free"),
+            _mk_titled("b", "2", "$10 for free"),
+        ]
+        assert match_cross_source_by_tokens(listings) == []
+
+    def test_single_source_returns_empty(self):
+        listings = [_mk_titled("slickdeals", "1", "Apple MacBook M3 256GB")]
+        assert match_cross_source_by_tokens(listings) == []
+
+
+# ---------------------------------------------------------------------------
+# match_cross_source_by_tokens — the headline use case
+# ---------------------------------------------------------------------------
+
+
+class TestTokenMatcherHappyPath:
+    def test_two_variants_of_same_title_cluster_across_sources(self):
+        """The reason this matcher exists — wording-tolerant matching."""
+        listings = [
+            _mk_titled(
+                "slickdeals",
+                "sd-1",
+                'Apple MacBook Air M3 256GB $799 + Free Shipping',
+                price=799.0,
+            ),
+            _mk_titled(
+                "dealnews",
+                "dn-1",
+                'Apple MacBook Air M3 256GB for $799 free shipping',
+                price=799.0,
+            ),
+        ]
+        groups = match_cross_source_by_tokens(listings)
+        assert len(groups) == 1
+        assert groups[0].source_count == 2
+        assert groups[0].listing_count == 2
+
+    def test_product_key_is_token_intersection_alphabetical(self):
+        listings = [
+            _mk_titled("a", "1", "Apple MacBook Air M3 256GB"),
+            _mk_titled("b", "2", "Apple MacBook Air M3 256GB"),
+        ]
+        groups = match_cross_source_by_tokens(listings)
+        assert len(groups) == 1
+        # Tokens: {apple, macbook, air, m3, 256gb} — sorted alphabetically
+        assert groups[0].product_key == "256gb air apple m3 macbook"
+
+    def test_clearly_different_products_do_not_cluster(self):
+        listings = [
+            _mk_titled(
+                "slickdeals",
+                "sd-1",
+                "Apple MacBook Air M3 256GB",
+                price=799.0,
+            ),
+            _mk_titled(
+                "dealnews",
+                "dn-1",
+                "Sony WH-1000XM5 Wireless Headphones",
+                price=278.0,
+            ),
+        ]
+        assert match_cross_source_by_tokens(listings) == []
+
+    def test_three_sources_same_product_yields_one_group(self):
+        listings = [
+            _mk_titled("a", "1", "Samsung 990 Pro 2TB SSD"),
+            _mk_titled("b", "2", "Samsung 990 Pro 2TB SSD"),
+            _mk_titled("c", "3", "Samsung 990 Pro 2TB SSD"),
+        ]
+        groups = match_cross_source_by_tokens(listings)
+        assert len(groups) == 1
+        assert groups[0].source_count == 3
+
+
+# ---------------------------------------------------------------------------
+# match_cross_source_by_tokens — threshold tuning
+# ---------------------------------------------------------------------------
+
+
+class TestTokenMatcherThresholds:
+    def test_high_threshold_rejects_partial_overlap(self):
+        listings = [
+            _mk_titled("a", "1", "Apple MacBook Air M3 256GB"),
+            _mk_titled("b", "2", "Apple MacBook Air M2 512GB"),
+        ]
+        # Jaccard: intersection {apple, macbook, air} / union {apple, macbook, air, m3, 256gb, m2, 512gb} = 3/7 ≈ 0.43
+        groups = match_cross_source_by_tokens(listings, similarity_threshold=0.9)
+        assert groups == []
+
+    def test_low_threshold_allows_partial_overlap(self):
+        listings = [
+            _mk_titled("a", "1", "Apple MacBook Air M3 256GB"),
+            _mk_titled("b", "2", "Apple MacBook Air M2 512GB"),
+        ]
+        groups = match_cross_source_by_tokens(listings, similarity_threshold=0.3)
+        assert len(groups) == 1
+
+    def test_invalid_similarity_rejected(self):
+        with pytest.raises(ValueError):
+            match_cross_source_by_tokens([], similarity_threshold=1.5)
+        with pytest.raises(ValueError):
+            match_cross_source_by_tokens([], similarity_threshold=-0.1)
+
+
+# ---------------------------------------------------------------------------
+# match_cross_source_by_tokens — realistic batch
+# ---------------------------------------------------------------------------
+
+
+class TestTokenMatcherRealistic:
+    def test_real_world_wording_variation(self):
+        """Exact phrasing differs between sources — token matcher still pairs."""
+        listings = [
+            _mk_titled(
+                "slickdeals",
+                "sd-1",
+                'Apple MacBook Air 13" M3 8GB 256GB $799 + Free Shipping',
+                price=799.0,
+            ),
+            _mk_titled(
+                "dealnews",
+                "dn-1",
+                'Apple MacBook Air 13" M3 8GB 256GB for $799 + free shipping',
+                price=799.0,
+            ),
+            # Noise: a different product in only one source
+            _mk_titled(
+                "slickdeals",
+                "sd-2",
+                "Cricut Beveled Blank Mug 2-Pack",
+                price=4.0,
+            ),
+        ]
+        groups = match_cross_source_by_tokens(listings)
+        assert len(groups) == 1
+        prices = sorted(listing.price for listing in groups[0].listings)
+        assert prices == [799.0, 799.0]
+
+    def test_determinism_across_input_orderings(self):
+        listings_a = [
+            _mk_titled("slickdeals", "sd-1", "Apple MacBook Air M3 256GB"),
+            _mk_titled("dealnews",   "dn-1", "Apple MacBook Air M3 256GB"),
+            _mk_titled("slickdeals", "sd-2", "Sony WH-1000XM5 Headphones"),
+            _mk_titled("dealnews",   "dn-2", "Sony WH-1000XM5 Headphones"),
+        ]
+        listings_b = list(reversed(listings_a))
+        groups_a = match_cross_source_by_tokens(listings_a)
+        groups_b = match_cross_source_by_tokens(listings_b)
+        assert [g.product_key for g in groups_a] == [
+            g.product_key for g in groups_b
+        ]

@@ -25,13 +25,22 @@ from aace_execution.pipeline.opportunity_scorer import ScoredOpportunity
 _NOW = datetime(2026, 5, 29, 12, 0, tzinfo=timezone.utc)
 
 
-def _mk_listing(source: str, price: float, *, lid_suffix: str = "a") -> NormalizedListing:
+_SHARED_TITLE = "Apple MacBook Air M3 256GB"
+
+
+def _mk_listing(
+    source: str,
+    price: float,
+    *,
+    lid_suffix: str = "a",
+    title: str = _SHARED_TITLE,
+) -> NormalizedListing:
     return NormalizedListing(
         source=source,
         listing_id=f"{source}:{lid_suffix}",
         external_id=lid_suffix,
-        product_key="shared product",
-        title=f"{source.title()} Listing",
+        product_key="apple macbook air m3 256gb",
+        title=title,
         url=f"https://{source}.example.com/{lid_suffix}",
         price=price,
         currency="USD",

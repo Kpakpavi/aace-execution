@@ -27,6 +27,10 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable
 
+from aace_execution.connectors._helpers import (
+    _jaccard_similarity,
+    _tokenize_title,
+)
 from aace_execution.connectors.base import NormalizedListing
 
 logger = logging.getLogger(__name__)
@@ -137,4 +141,154 @@ def match_cross_source(
         },
     )
 
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# Token-based matcher (post-v0.1.0 upgrade — see _helpers._tokenize_title).
+# ---------------------------------------------------------------------------
+
+
+def match_cross_source_by_tokens(
+    listings: Iterable[NormalizedListing],
+    *,
+    min_sources: int = 2,
+    similarity_threshold: float = 0.6,
+) -> list[MatchGroup]:
+    """Cross-source match using token-set + Jaccard similarity.
+
+    The exact-key matcher (``match_cross_source`` above) misses real
+    overlaps when titles differ by even a single filler word — e.g.
+    "MacBook ... $799" vs "MacBook ... for $799 free shipping". This
+    function tolerates that by:
+
+        1. Converting each title to a set of tokens (stopwords + price
+           noise stripped — see ``_tokenize_title``).
+        2. Clustering listings whose pairwise Jaccard similarity meets
+           ``similarity_threshold``, via union-find.
+        3. Returning only clusters with at least ``min_sources``
+           distinct sources.
+
+    Args:
+        listings: flat sequence of normalized listings from any number
+            of connectors. Order doesn't matter.
+        min_sources: drop clusters below this many distinct sources.
+            Default 2 — the only value that makes sense for v0.1.0.
+        similarity_threshold: Jaccard cutoff for two titles to cluster.
+            Default 0.6 — a middle ground between false positives
+            (very different products clustering) and false negatives
+            (same product missed because wording differs too much).
+            Raise to 0.75+ for stricter matching; lower to 0.4 to see
+            more candidate matches.
+
+    Returns:
+        Sorted list of ``MatchGroup`` objects. Each group's
+        ``product_key`` is the intersection of token sets in the
+        cluster (alphabetically joined) — stable across runs and
+        useful as a dedup key downstream.
+
+    Complexity:
+        O(N²) on the number of listings (pairwise Jaccard) +
+        O(α(N)) per union-find op. For hundreds of listings per tick
+        this is still sub-millisecond on any modern CPU.
+    """
+    if min_sources < 1:
+        raise ValueError(f"min_sources must be >= 1, got {min_sources!r}")
+    if not 0.0 <= similarity_threshold <= 1.0:
+        raise ValueError(
+            f"similarity_threshold must be in [0, 1], "
+            f"got {similarity_threshold!r}"
+        )
+
+    # Build (listing, tokens) pairs, dropping listings with empty token sets
+    # (no useful content to match on — e.g. all stopwords or unparseable).
+    items: list[tuple[NormalizedListing, frozenset[str]]] = []
+    for listing in listings:
+        tokens = _tokenize_title(listing.title)
+        if tokens:
+            items.append((listing, tokens))
+
+    n = len(items)
+    if n == 0:
+        return []
+
+    # Union-Find with path compression. parent[i] points to a representative
+    # in i's cluster; following the chain eventually reaches the root.
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    # Pairwise comparison: link any two listings whose token sets are
+    # similar enough. This is the only O(N²) step.
+    for i in range(n):
+        ti = items[i][1]
+        for j in range(i + 1, n):
+            tj = items[j][1]
+            if _jaccard_similarity(ti, tj) >= similarity_threshold:
+                union(i, j)
+
+    # Group items by cluster root.
+    clusters: dict[int, list[tuple[NormalizedListing, frozenset[str]]]] = (
+        defaultdict(list)
+    )
+    for i in range(n):
+        clusters[find(i)].append(items[i])
+
+    groups: list[MatchGroup] = []
+    for cluster in clusters.values():
+        sources = {listing.source for listing, _ in cluster}
+        if len(sources) < min_sources:
+            continue
+
+        cluster_listings = [listing for listing, _ in cluster]
+        cluster_tokens = [tokens for _, tokens in cluster]
+
+        # Derive a stable canonical product_key from the intersection
+        # of token sets across the cluster. This is what downstream
+        # uses for dedup and human-readable identification.
+        common = cluster_tokens[0]
+        for ts in cluster_tokens[1:]:
+            common = common & ts
+
+        if common:
+            product_key = " ".join(sorted(common))
+        else:
+            # Cluster of similar-but-non-identical token sets. Fall back
+            # to the listing.product_key of the shortest title (most
+            # information-dense, typically).
+            product_key = min(
+                cluster_listings, key=lambda l: (len(l.title), l.listing_id)
+            ).product_key or "match"
+
+        cluster_listings.sort(key=lambda l: (l.source, l.listing_id))
+        groups.append(
+            MatchGroup(
+                product_key=product_key,
+                listings=tuple(cluster_listings),
+            )
+        )
+
+    groups.sort(key=lambda g: g.product_key)
+
+    logger.info(
+        "cross_source_token_match_complete",
+        extra={
+            "input_listings": n,
+            "clusters_total": len(clusters),
+            "cross_source_groups": len(groups),
+            "min_sources": min_sources,
+            "similarity_threshold": similarity_threshold,
+        },
+    )
     return groups

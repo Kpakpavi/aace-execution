@@ -45,7 +45,9 @@ from aace_execution.integrations.agent_webhook import (
     WebhookDeliveryResult,
     WebhookPayload,
 )
-from aace_execution.pipeline.cross_source_matcher import match_cross_source
+from aace_execution.pipeline.cross_source_matcher import (
+    match_cross_source_by_tokens,
+)
 from aace_execution.pipeline.opportunity_scorer import (
     OpportunityScorer,
     ScoredOpportunity,
@@ -90,12 +92,14 @@ class Worker:
         connectors: Sequence[BaseConnector],
         scorer: OpportunityScorer,
         webhook_client: AgentWebhookClient,
+        similarity_threshold: float = 0.6,
     ) -> None:
         if not connectors:
             raise ValueError("at least one connector is required")
         self._connectors = list(connectors)
         self._scorer = scorer
         self._webhook = webhook_client
+        self._similarity_threshold = similarity_threshold
 
     def run_once(self) -> WorkerRunResult:
         """One full tick. Never raises — errors are captured in the result."""
@@ -129,7 +133,10 @@ class Worker:
                     extra={"connector": connector.name},
                 )
 
-        groups = match_cross_source(all_listings)
+        groups = match_cross_source_by_tokens(
+            all_listings,
+            similarity_threshold=self._similarity_threshold,
+        )
 
         scored: list[ScoredOpportunity] = []
         for group in groups:
@@ -227,6 +234,7 @@ def _listing_summary(listing: NormalizedListing) -> dict:
 def _build_default_worker() -> Worker:
     """Wire up connectors + scorer + webhook from environment."""
     # Imports are local so unit tests don't need feedparser/httpx etc.
+    from aace_execution.connectors.bensbargains import BensBargainsConnector
     from aace_execution.connectors.dealnews import DealNewsConnector
     from aace_execution.connectors.slickdeals import SlickdealsConnector
 
@@ -257,12 +265,18 @@ def _build_default_worker() -> Worker:
     connectors: list[BaseConnector] = [
         SlickdealsConnector(),
         DealNewsConnector(),
+        BensBargainsConnector(),
     ]
+
+    similarity_threshold = float(
+        os.environ.get("MATCHER_SIMILARITY_THRESHOLD", "0.6")
+    )
 
     return Worker(
         connectors=connectors,
         scorer=scorer,
         webhook_client=webhook_client,
+        similarity_threshold=similarity_threshold,
     )
 
 
