@@ -268,10 +268,11 @@ def match_cross_source_by_tokens(
             # to the listing.product_key of the shortest title (most
             # information-dense, typically).
             product_key = min(
-                cluster_listings, key=lambda l: (len(l.title), l.listing_id)
+                cluster_listings,
+                key=lambda listing: (len(listing.title), listing.listing_id),
             ).product_key or "match"
 
-        cluster_listings.sort(key=lambda l: (l.source, l.listing_id))
+        cluster_listings.sort(key=lambda listing: (listing.source, listing.listing_id))
         groups.append(
             MatchGroup(
                 product_key=product_key,

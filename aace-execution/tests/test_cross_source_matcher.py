@@ -225,8 +225,10 @@ class TestOrdering:
         groups_a = match_cross_source(listings_a)
         groups_b = match_cross_source(listings_b)
         assert [g.product_key for g in groups_a] == [g.product_key for g in groups_b]
-        assert [tuple(l.listing_id for l in g.listings) for g in groups_a] == [
-            tuple(l.listing_id for l in g.listings) for g in groups_b
+        assert [
+            tuple(listing.listing_id for listing in g.listings) for g in groups_a
+        ] == [
+            tuple(listing.listing_id for listing in g.listings) for g in groups_b
         ]
 
 

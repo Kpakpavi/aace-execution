@@ -33,7 +33,6 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Callable
 
-from aace_execution.persistence.db import connect as connect_postgres
 from aace_execution.persistence.postgres_writer import PostgresWriter
 from aace_execution.validators.input_validator import (
     InputValidator,

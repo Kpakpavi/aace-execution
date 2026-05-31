@@ -10,7 +10,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.aace_execution.connectors.base import RawListing
 from src.aace_execution.connectors.slickdeals import (
     SlickdealsConnector,
     _extract_price,

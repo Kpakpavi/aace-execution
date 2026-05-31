@@ -128,7 +128,8 @@ class OpportunityScorer:
 
         sources = sorted(group.sources)
         listings_sorted = sorted(
-            group.listings, key=lambda l: (l.price, l.source, l.listing_id)
+            group.listings,
+            key=lambda listing: (listing.price, listing.source, listing.listing_id),
         )
 
         opp = ScoredOpportunity(
