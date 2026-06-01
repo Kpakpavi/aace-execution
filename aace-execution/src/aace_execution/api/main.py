@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 
 from aace_execution.api.models import RunPipelineRequest
 from aace_execution.api.responses import RunPipelineResponse
+from aace_execution.observability import init_sentry
+
 from aace_execution.persistence.db import connect
 from aace_execution.persistence.postgres_writer import PostgresWriter
 from aace_execution.pipeline.pipeline_runner import PipelineRunner
@@ -21,6 +23,8 @@ ALLOWED_SOURCES = frozenset({"source_a", "source_b"})
 FRESHNESS_WINDOW_SECONDS = 3600
 
 logger = logging.getLogger(__name__)
+
+init_sentry(service_name="aace-api")
 
 app = FastAPI(
     title="AACE Execution API",

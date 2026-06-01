@@ -242,6 +242,7 @@ def _build_default_worker() -> Worker:
     from aace_execution.connectors.bensbargains import BensBargainsConnector
     from aace_execution.connectors.dealnews import DealNewsConnector
     from aace_execution.connectors.slickdeals import SlickdealsConnector
+    from aace_execution.connectors.techbargains import TechBargainsConnector
 
     webhook_url = os.environ.get("AGENT_WEBHOOK_URL")
     webhook_secret = os.environ.get("AGENT_WEBHOOK_SECRET")
@@ -271,6 +272,7 @@ def _build_default_worker() -> Worker:
         SlickdealsConnector(),
         DealNewsConnector(),
         BensBargainsConnector(),
+        TechBargainsConnector(),
     ]
 
     similarity_threshold = float(
@@ -307,6 +309,9 @@ def main() -> None:
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+    from aace_execution.observability import init_sentry
+    init_sentry(service_name="aace-worker")
 
     interval_minutes = int(os.environ.get("WORKER_INTERVAL_MINUTES", "30"))
     if interval_minutes < 1:

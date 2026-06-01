@@ -129,6 +129,7 @@ def _print_near_miss_report(*, top_n: int = 5) -> None:
     from aace_execution.connectors.bensbargains import BensBargainsConnector
     from aace_execution.connectors.dealnews import DealNewsConnector
     from aace_execution.connectors.slickdeals import SlickdealsConnector
+    from aace_execution.connectors.techbargains import TechBargainsConnector
 
     print("Diagnostic: top cross-source title similarities")
     print("(matcher works on real data even when no pair crosses threshold)")
@@ -139,6 +140,7 @@ def _print_near_miss_report(*, top_n: int = 5) -> None:
         SlickdealsConnector(),
         DealNewsConnector(),
         BensBargainsConnector(),
+        TechBargainsConnector(),
     ):
         try:
             listings.extend(connector.run())
