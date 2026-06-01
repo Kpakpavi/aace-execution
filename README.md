@@ -1,24 +1,24 @@
 # AACE — Autonomous Arbitrage Commerce Engine
 
-> An automated deal-discovery system that ingests product listings from multiple marketplaces, scores price discrepancies, and surfaces high-confidence arbitrage opportunities through a live dashboard and real-time alerts.
+> Continuously pulls deals from multiple aggregator sites, finds the same product across sources, scores the price spread, and ships scored opportunities to an AI agent via a signed webhook.
 
+[![CI](https://github.com/Kpakpavi/aace-execution/actions/workflows/ci.yml/badge.svg)](https://github.com/Kpakpavi/aace-execution/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.136+-009688.svg)](https://fastapi.tiangolo.com/)
-[![Status: active development](https://img.shields.io/badge/status-active%20development-orange.svg)](#roadmap)
+[![Tests](https://img.shields.io/badge/tests-540+%20passing-brightgreen.svg)](#development)
 
 ---
 
 ## What it does
 
-Manual deal hunting (Slickdeals, retailer alerts, Reddit threads) doesn't scale. AACE automates the loop:
+Manual deal hunting doesn't scale. AACE automates the loop end-to-end:
 
-1. **Ingest** listings continuously from multiple sources (eBay, Amazon, Slickdeals, Reddit, configurable web retailers).
-2. **Detect** price discrepancies across sources for the same product.
-3. **Score** each opportunity by margin, volume, source reliability, and historical price baselines.
-4. **Decide** whether to alert based on configurable score thresholds, dedup rules, and budget guards.
-5. **Notify** the operator via email digests and SMS for high-score deals.
-6. **Visualize** everything in a Streamlit dashboard for ongoing review and tuning.
+1. **Ingest** — pull live deals from multiple free RSS / JSON aggregator sources every 30 minutes (Slickdeals, DealNews, Ben's Bargains, TechBargains).
+2. **Match** — cluster listings across sources by title-token Jaccard similarity so the same product appearing on two sources gets paired.
+3. **Score** — compute the price spread (absolute + percent) and threshold it.
+4. **Ship** — POST scored opportunities to an external AI agent via HMAC-signed webhook with retry + 24h dedup.
+5. **Persist** — write every shipped opportunity to Postgres so the Streamlit dashboard shows what the worker is doing in real time.
 
 ## Architecture
 
@@ -26,31 +26,26 @@ Manual deal hunting (Slickdeals, retailer alerts, Reddit threads) doesn't scale.
 flowchart LR
     subgraph Sources
       A[Slickdeals RSS]
-      B[Reddit JSON]
-      C[eBay Browse API]
-      D[Amazon via Keepa]
-      E[Generic Web Scraper]
+      B[DealNews RSS]
+      C["Ben's Bargains RSS"]
+      D[TechBargains RSS]
     end
 
-    A & B & C & D & E -->|Connectors| P[Pipeline Runner]
+    SCHED[APScheduler<br/>30 min interval] --> CONNS
 
-    subgraph Pipeline
-      P --> V[Input Validator]
-      V --> DD[Discrepancy Detector]
-      DD --> SC[Opportunity Scoring]
-      SC --> DUP[Duplicate Check]
-      DUP --> AD[Alert Decision]
-    end
+    A & B & C & D -->|Connectors| CONNS[Connector Layer]
 
-    AD --> DB[(PostgreSQL)]
-    AD --> EM[Email - SendGrid]
-    AD --> SM[SMS - Twilio]
+    CONNS --> MATCH[Token + Jaccard<br/>Cross-Source Matcher]
+    MATCH --> SCORE[Price-Spread<br/>Opportunity Scorer]
+    SCORE --> WHK[HMAC-Signed<br/>Webhook Client]
+    SCORE --> DB[(PostgreSQL)]
 
-    DB --> API[FastAPI - X-API-Key auth]
+    WHK --> AGENT[External AI Agent]
+    DB --> API[FastAPI - X-API-Key]
     API --> DASH[Streamlit Dashboard]
 ```
 
-The system runs as three Docker services (`postgres`, `api`, `dashboard`) orchestrated via Docker Compose.
+The system runs as four Docker services (`postgres`, `api`, `dashboard`, `worker`) orchestrated via Docker Compose.
 
 ## Quick start
 
@@ -60,24 +55,31 @@ Prerequisites: Docker, Docker Compose v2.
 git clone https://github.com/Kpakpavi/aace-execution.git
 cd aace-execution
 cp .env.example .env
-# Edit .env: set AACE_API_KEY to a long random string
-docker compose up --build
+# Edit .env: set AACE_API_KEY, AGENT_WEBHOOK_URL, AGENT_WEBHOOK_SECRET
+docker compose up -d --build
 ```
 
 Then:
 
-- API: <http://localhost:8000> (all endpoints require `X-API-Key` header except `/health`)
-- Dashboard: <http://localhost:8502>
-- Postgres: `localhost:5433` (mapped from container `5432`)
+- **Dashboard**: http://localhost:8502 — live worker opportunities + analytics
+- **API**: http://localhost:8000 — all endpoints require `X-API-Key` header except `/health`
+- **Postgres**: `localhost:5433` (mapped from container `5432`)
+- **Worker**: runs in the background, ticks every `WORKER_INTERVAL_MINUTES` (default 30)
 
-Run a sample pipeline:
+## Local demo (no Docker, no deployment)
+
+Want to see the full loop run end-to-end locally before deploying?
 
 ```bash
-curl -X POST http://localhost:8000/run-pipeline \
-  -H "X-API-Key: $AACE_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d @aace-execution/examples/sample_pipeline_input.json
+cd aace-execution
+uv sync
+# Get a free disposable URL at https://webhook.site
+export AGENT_WEBHOOK_URL="https://webhook.site/your-id"
+export AGENT_WEBHOOK_SECRET="demo-secret"
+uv run python scripts/local_demo.py
 ```
+
+The demo fetches from all 4 live sources, runs the token matcher, scores cross-source matches, and POSTs to your webhook URL. Even if no matches cross threshold this exact tick, the **diagnostic section** shows the top 5 near-miss pairs so you can see the matcher working on real data.
 
 ## API endpoints
 
@@ -86,100 +88,104 @@ All require `X-API-Key` except `/health`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | Liveness probe (no auth) |
-| POST | `/run-pipeline` | Execute the 6-stage pipeline on supplied inputs |
-| GET | `/pipeline-results/{run_id}` | Fetch a single run's results |
-| GET | `/opportunities` | List detected opportunities, paginated |
-| GET | `/alert-decisions` | List per-opportunity alert decisions |
-| GET | `/analytics/opportunity-summary` | Aggregate stats (counts, avg score) |
+| GET | `/worker-opportunities` | List opportunities the scheduled worker shipped to the AI agent |
+| POST | `/run-pipeline` | Execute the 6-stage pipeline on supplied inputs (legacy) |
+| GET | `/pipeline-results/{run_id}` | Fetch a single pipeline run's results |
+| GET | `/opportunities` | Detected opportunities (legacy pipeline) |
+| GET | `/alert-decisions` | Per-opportunity alert decisions |
+| GET | `/analytics/opportunity-summary` | Aggregate stats |
 | GET | `/analytics/top-products` | Top products by opportunity frequency |
 | GET | `/analytics/alert-rate` | Rolling alert-fire rate |
-| GET | `/analytics/high-score-opportunities` | Opportunities above the hot-deal threshold |
-| GET | `/analytics/daily-opportunities` | Per-day opportunity counts (time series) |
+| GET | `/analytics/high-score-opportunities` | High-score opportunities |
+| GET | `/analytics/daily-opportunities` | Daily time series |
 
 ## Environment variables
 
-Defined in `.env` (use `.env.example` as a template).
+See `.env.example` for the full annotated list. Required:
 
-| Var | Required | Purpose |
-|---|---|---|
-| `POSTGRES_HOST` | yes | DB hostname (`postgres` inside Docker, `localhost` outside) |
-| `POSTGRES_PORT` | yes | DB port (`5432` inside Docker, `5433` outside) |
-| `POSTGRES_DB` | yes | Database name (default `aace`) |
-| `POSTGRES_USER` | yes | DB user (default `postgres` for local dev) |
-| `POSTGRES_PASSWORD` | yes | DB password — change for any non-local deployment |
-| `AACE_API_KEY` | yes | Shared secret required in `X-API-Key` header |
-| `AACE_API_BASE_URL` | dashboard only | API URL the dashboard targets |
+| Var | Purpose |
+|---|---|
+| `AACE_API_KEY` | Shared secret for the `X-API-Key` header |
+| `AGENT_WEBHOOK_URL` | Where the worker POSTs scored opportunities |
+| `AGENT_WEBHOOK_SECRET` | HMAC-SHA256 secret signing the webhook body |
+| `POSTGRES_PASSWORD` | Override the default for any deployed instance |
 
-Additional vars unlocked as connectors/alerts ship (see [Roadmap](#roadmap)): `KEEPA_API_KEY`, `EBAY_APP_ID`, `EBAY_CERT_ID`, `REDDIT_CLIENT_ID`, `SENDGRID_API_KEY`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `ALERT_EMAIL_TO`, `ALERT_SMS_TO`, `SMS_DAILY_BUDGET`, `HOT_SCORE_THRESHOLD`.
+Optional tuning: `MATCHER_SIMILARITY_THRESHOLD`, `SCORER_MIN_ABS_SPREAD`, `SCORER_MIN_PCT_SPREAD`, `WORKER_INTERVAL_MINUTES`, `SENTRY_DSN`.
+
+## Deployment
+
+A 30-minute walkthrough from a fresh VPS to AACE running 24/7 lives in [`DEPLOY.md`](DEPLOY.md). Covers Hetzner, DigitalOcean, and Oracle Cloud Free Tier.
 
 ## Project structure
 
 ```
 .
-├── Dockerfile              # API container (builds from aace-execution/)
-├── docker-compose.yml      # postgres + api + dashboard
-├── dashboard/              # Streamlit dashboard
-│   ├── app.py
-│   └── Dockerfile
-├── aace-execution/         # Core service
+├── DEPLOY.md                # 30-min server provisioning walkthrough
+├── docker-compose.yml       # postgres + api + dashboard + worker
+├── Dockerfile               # builds the api and worker images
+├── dashboard/               # Streamlit dashboard
+├── aace-execution/
 │   ├── src/aace_execution/
-│   │   ├── api/            # FastAPI app + auth middleware + endpoints
-│   │   ├── pipeline/       # 6-stage pipeline runner
-│   │   ├── workers/        # validator / discrepancy / scoring / alert decision
-│   │   ├── persistence/    # PostgreSQL writer + repository
-│   │   └── validators/     # Input validation
-│   ├── sql/schema.sql      # DB schema (auto-loaded on first compose up)
-│   └── tests/              # Pytest suite
-└── Autonomous Arbitrage Commerce Engine (AACE)/
-    └── directives/         # Architecture decision records + spec
+│   │   ├── connectors/      # Slickdeals, DealNews, Ben's, TechBargains, Reddit
+│   │   ├── pipeline/        # Cross-source matcher + opportunity scorer + 6-stage runner
+│   │   ├── integrations/    # HMAC-signed agent webhook client
+│   │   ├── persistence/     # Postgres writers
+│   │   ├── api/             # FastAPI app + endpoints
+│   │   ├── worker.py        # APScheduler entry point
+│   │   └── observability.py # Optional Sentry initialization
+│   ├── scripts/             # local_demo.py + synthetic demo
+│   ├── sql/                 # Auto-loaded schema files
+│   └── tests/               # 540+ pytest cases
+└── .github/workflows/ci.yml # ruff + pytest on every push and PR
 ```
 
 ## Development
 
 ```bash
 cd aace-execution
-uv sync --dev
-uv run pytest
-uv run ruff check
+uv sync
+uv run pytest -v
+uv run ruff check src tests
 ```
 
-Tests are workers + persistence + API endpoint coverage. New connectors and alerts must ship with fixtures + tests.
+Tests are fully offline (network, sleeping, DB all mocked) and run in ~1 second. The `test_*_connector.py` suites use embedded RSS/JSON fixtures; the matcher, scorer, and webhook suites mock injectable dependencies.
+
+CI runs the full suite + ruff on every push and PR. See the badge at the top of this README.
 
 ## Roadmap
 
-**Completed (v0.x):**
-- 6-stage pipeline (validator → discrepancy → scoring → dedup → alert decision → assembly)
-- FastAPI service with X-API-Key auth and analytics endpoints
-- PostgreSQL persistence with auto-init schema
-- Streamlit dashboard wired to the API via internal Docker network
-- Docker Compose orchestration
+**Shipped (v0.1):**
+- 4 active connectors (Slickdeals, DealNews, Ben's Bargains, TechBargains) + 1 shelved (Reddit, pending OAuth)
+- Token-set + Jaccard cross-source matcher with configurable threshold
+- Price-spread opportunity scorer
+- HMAC-signed webhook with exponential backoff retry + 24h dedup
+- APScheduler worker process running on a configurable interval
+- Optional Postgres persistence + dashboard panel
+- Optional Sentry error tracking
+- GitHub Actions CI (ruff + pytest)
+- Docker Compose deployment + hardened VPS walkthrough
 
-**In progress (v1.0 target):**
-- Slickdeals RSS connector
-- Reddit connector (configurable subs)
-- eBay Browse + Marketplace Insights connector
-- Amazon price history via Keepa
-- Generic web scraper (per-retailer YAML config)
-- Email alerts (SendGrid) — per-deal + daily digest
-- SMS alerts (Twilio) — score-gated, daily-budget-capped
-- APScheduler-driven periodic pipeline runs
-- Structured JSON logs + Sentry integration + `/metrics`
-- GitHub Actions CI (pytest + ruff + docker build)
-- VPS deployment + reverse proxy + Tailscale or HTTPS
-- Monetization playbook + alert-outcome tracking
+**Next (v0.2):**
+- Reactivate Reddit via OAuth credentials
+- Stronger product-key extraction (brand/model weighting, eventually GTIN/UPC/ASIN)
+- eBay Browse + Marketplace Insights connector (sold comps as the gold-standard baseline)
+- Amazon price history via Keepa (paid)
+- Generic YAML-driven scraper for Walmart, Target, Newegg, Costco
+- Structured JSON logs + `/metrics` Prometheus endpoint
+- Alert-outcome tracking (which deals did the user actually act on, what was the realized margin)
 
-See [PLAN.md](aace-execution/PLAN.md) for the day-by-day execution schedule.
-
-## Architecture decisions
-
-The `Autonomous Arbitrage Commerce Engine (AACE)/directives/` folder contains 7 ADRs explaining the major choices (single-service architecture, PostgreSQL for storage, API-key auth, marketplace integration strategy, queue model, observability stack, deployment model) and a full feature spec.
+**Later:**
+- International / resale (AliExpress, Temu, StockX, Mercari)
+- Multi-currency support
+- Per-source rate-limit configuration via UI
 
 ## Security notes
 
 - `.env` is gitignored. Never commit secrets.
 - Default `POSTGRES_PASSWORD=postgres` in `docker-compose.yml` is for local dev only — override via `.env` for any deployed instance.
 - All API endpoints except `/health` require the `X-API-Key` header.
-- For VPS deployments, run the dashboard behind Tailscale or behind a reverse proxy with basic auth — it does not have its own auth layer.
+- The webhook to the AI agent is HMAC-SHA256 signed; the agent **must** verify the signature before trusting the payload.
+- For VPS deployments, run the dashboard behind Tailscale or a reverse proxy with basic auth — it does not have its own auth layer.
 
 ## License
 
