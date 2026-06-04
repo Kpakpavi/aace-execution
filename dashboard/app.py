@@ -119,6 +119,71 @@ def fetch_worker_opportunities(limit: int = 25):
         return None, str(exc)
 
 
+# ---------------------------------------------------------------------------
+# All Live Deals — browse the firehose of deals across all sources
+# ---------------------------------------------------------------------------
+
+
+def fetch_all_deals(query: str = "", max_results: int = 200):
+    try:
+        params = {"max_results": max_results}
+        if query.strip():
+            params["q"] = query.strip()
+        response = requests.get(
+            f"{API_BASE_URL}/all-deals",
+            params=params,
+            headers={"X-API-Key": os.environ.get("AACE_API_KEY", "")},
+            timeout=60,
+        )
+        response.raise_for_status()
+        return response.json(), None
+    except requests.RequestException as exc:
+        return None, str(exc)
+
+
+st.header("All Live Deals")
+st.caption(
+    "Browse every current deal AACE is watching, across all 4 sources. "
+    "Type a product (iPhone, MacBook, headphones) to filter. "
+    "Sorted by price."
+)
+
+search_query = st.text_input(
+    "Search deal titles",
+    placeholder="Try: iPhone, MacBook, vacuum, AirPods, headphones...",
+    key="all_deals_query",
+)
+
+with st.spinner("Fetching from Slickdeals + DealNews + Ben's Bargains + TechBargains..."):
+    all_deals, all_deals_err = fetch_all_deals(search_query)
+
+if all_deals_err:
+    st.error(f"Failed to load deals: {all_deals_err}")
+elif not all_deals:
+    if search_query:
+        st.info(f"No deals matched '{search_query}'. Try a broader term.")
+    else:
+        st.info("No deals returned. Connectors may be temporarily unreachable.")
+else:
+    st.success(f"{len(all_deals)} deals found · cheapest first")
+    rows = []
+    for deal in all_deals:
+        rows.append({
+            "Source": deal.get("source", ""),
+            "Title": deal.get("title", "")[:120],
+            "Price": f"${deal.get('price', 0):.2f}",
+            "Link": deal.get("url", ""),
+        })
+    st.dataframe(
+        rows,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Link": st.column_config.LinkColumn("Link", display_text="Open"),
+        },
+    )
+st.divider()
+
 st.header("Live Worker Output")
 st.caption(
     "Most recent opportunities the scheduled worker scored and shipped to "
@@ -161,7 +226,11 @@ else:
     col1.metric("Total Opportunities", summary["total_opportunities"])
     col2.metric("Alert Eligible", summary["alert_eligible"])
     col3.metric("No Alert", summary["no_alert"])
-    col4.metric("Average Score", round(summary["average_score"], 2))
+    avg_score = summary.get("average_score")
+    col4.metric(
+        "Average Score",
+        round(avg_score, 2) if avg_score is not None else "—",
+    )
 
 st.divider()
 

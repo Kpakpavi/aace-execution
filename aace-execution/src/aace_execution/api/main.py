@@ -696,6 +696,56 @@ def run_pipeline(request: RunPipelineRequest) -> RunPipelineResponse:
         )
 
 
+@app.get(
+    "/all-deals",
+    summary="Live cross-source deal browser",
+    description=(
+        "Fetches every current listing from all connectors and returns "
+        "them flat, optionally filtered by a search query against the "
+        "title. Use this to browse deals like a multi-source aggregator."
+    ),
+)
+def list_all_deals(
+    q: str | None = Query(None, description="Case-insensitive substring match on title"),
+    max_results: int = Query(200, ge=1, le=1000),
+) -> list[dict]:
+    # Local imports so unit tests don't need feedparser/httpx.
+    from aace_execution.connectors.bensbargains import BensBargainsConnector
+    from aace_execution.connectors.dealnews import DealNewsConnector
+    from aace_execution.connectors.slickdeals import SlickdealsConnector
+    from aace_execution.connectors.techbargains import TechBargainsConnector
+
+    needle = q.lower().strip() if q else None
+    deals: list[dict] = []
+
+    for connector_cls in (
+        SlickdealsConnector,
+        DealNewsConnector,
+        BensBargainsConnector,
+        TechBargainsConnector,
+    ):
+        try:
+            for listing in connector_cls().run():
+                title = listing.title or ""
+                if needle and needle not in title.lower():
+                    continue
+                deals.append({
+                    "source": listing.source,
+                    "title": title,
+                    "price": float(listing.price),
+                    "currency": listing.currency,
+                    "url": listing.url,
+                })
+        except Exception as exc:
+            logger.warning(
+                "all_deals_connector_failed",
+                extra={"connector": connector_cls.__name__, "error": str(exc)},
+            )
+
+    deals.sort(key=lambda d: d["price"])
+    return deals[:max_results]
+
+
 _WORKER_OPPORTUNITY_COLUMNS = (
     "opportunity_id",
     "product_key",
