@@ -129,9 +129,12 @@ class NtfyNotifier:
             try:
                 return float(val)
             except ValueError:
+                # NOTE: don't use the key "name" in extra={} — it collides
+                # with Python's built-in LogRecord.name attribute and raises
+                # KeyError. Using "env_var" instead.
                 logger.warning(
                     "ntfy_env_bad_number",
-                    extra={"name": name, "value": val, "default": default},
+                    extra={"env_var": name, "value": val, "default": default},
                 )
                 return default
 
