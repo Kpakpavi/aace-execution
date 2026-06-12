@@ -268,7 +268,8 @@ class NtfyNotifier:
         if listings:
             try:
                 cheapest = min(
-                    listings, key=lambda l: getattr(l, "price", float("inf"))
+                    listings,
+                    key=lambda listing: getattr(listing, "price", float("inf")),
                 )
                 buy_url = getattr(cheapest, "url", None)
             except Exception:  # noqa: BLE001

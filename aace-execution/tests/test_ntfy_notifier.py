@@ -7,10 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from aace_execution.integrations.ntfy_notifier import (
-    NtfyDeliveryResult,
-    NtfyNotifier,
-)
+from aace_execution.integrations.ntfy_notifier import NtfyNotifier
 
 
 @dataclass

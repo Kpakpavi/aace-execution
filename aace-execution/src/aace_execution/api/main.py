@@ -9,6 +9,11 @@ from fastapi.responses import JSONResponse
 
 from aace_execution.api.models import RunPipelineRequest
 from aace_execution.api.responses import RunPipelineResponse
+from aace_execution.connectors.resale_comps import (
+    KeepaClient,
+    RoutedResaleCompsClient,
+    SerpApiClient,
+)
 from aace_execution.observability import init_sentry
 
 from aace_execution.persistence.db import connect
@@ -766,11 +771,8 @@ _WORKER_OPPORTUNITY_COLUMNS = (
 # (real if SERPAPI_KEY is set; mock otherwise). The router falls back
 # to the mock cleanly if either client fails or isn't configured —
 # so missing or revoked keys never break the dashboard.
-from aace_execution.connectors.resale_comps import (
-    KeepaClient,
-    RoutedResaleCompsClient,
-    SerpApiClient,
-)
+# (KeepaClient / RoutedResaleCompsClient / SerpApiClient imported at the
+# top of the file to satisfy ruff E402; this section just wires them up.)
 
 
 def _build_resale_comps_client() -> RoutedResaleCompsClient:

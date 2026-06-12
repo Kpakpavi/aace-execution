@@ -11,7 +11,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from aace_execution.integrations.telegram_notifier import (
-    TelegramDeliveryResult,
     TelegramNotifier,
     _escape_md_v2,
     _escape_md_v2_link,

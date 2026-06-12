@@ -312,7 +312,10 @@ class TelegramNotifier:
         buy_url: str | None = None
         if listings:
             try:
-                cheapest = min(listings, key=lambda l: getattr(l, "price", float("inf")))
+                cheapest = min(
+                    listings,
+                    key=lambda listing: getattr(listing, "price", float("inf")),
+                )
                 buy_url = getattr(cheapest, "url", None)
             except Exception:  # noqa: BLE001
                 buy_url = None
