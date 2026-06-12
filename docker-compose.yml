@@ -34,6 +34,10 @@ services:
       AACE_API_KEY: ${AACE_API_KEY:?AACE_API_KEY must be set in .env}
       SENTRY_DSN: ${SENTRY_DSN:-}
       SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
+      # Resale-comps API keys. Both optional — if blank, the router
+      # transparently falls back to the deterministic mock client.
+      KEEPA_API_KEY: ${KEEPA_API_KEY:-}
+      SERPAPI_KEY: ${SERPAPI_KEY:-}
 
   dashboard:
     build:
@@ -74,6 +78,21 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       SENTRY_DSN: ${SENTRY_DSN:-}
       SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
+      # Telegram notifier (optional). Blank = disabled — worker only
+      # delivers via the agent webhook in that case.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_MIN_NET_PROFIT: ${TELEGRAM_MIN_NET_PROFIT:-1.00}
+      TELEGRAM_MIN_ROI_PERCENT: ${TELEGRAM_MIN_ROI_PERCENT:-3.0}
+      TELEGRAM_DEFAULT_PLATFORM: ${TELEGRAM_DEFAULT_PLATFORM:-eBay}
+      TELEGRAM_DEFAULT_SHIPPING: ${TELEGRAM_DEFAULT_SHIPPING:-8.00}
+      # NTFY.sh notifier (optional, free, no signup). Blank topic = off.
+      NTFY_TOPIC: ${NTFY_TOPIC:-}
+      NTFY_SERVER: ${NTFY_SERVER:-https://ntfy.sh}
+      NTFY_MIN_NET_PROFIT: ${NTFY_MIN_NET_PROFIT:-1.00}
+      NTFY_MIN_ROI_PERCENT: ${NTFY_MIN_ROI_PERCENT:-3.0}
+      NTFY_DEFAULT_PLATFORM: ${NTFY_DEFAULT_PLATFORM:-eBay}
+      NTFY_DEFAULT_SHIPPING: ${NTFY_DEFAULT_SHIPPING:-8.00}
     depends_on:
       - postgres
 

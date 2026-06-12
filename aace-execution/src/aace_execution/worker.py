@@ -94,6 +94,8 @@ class Worker:
         webhook_client: AgentWebhookClient,
         similarity_threshold: float = 0.6,
         opportunity_writer: Any = None,
+        telegram_notifier: Any = None,
+        ntfy_notifier: Any = None,
     ) -> None:
         if not connectors:
             raise ValueError("at least one connector is required")
@@ -102,6 +104,11 @@ class Worker:
         self._webhook = webhook_client
         self._similarity_threshold = similarity_threshold
         self._opportunity_writer = opportunity_writer
+        # Optional secondary delivery channels. Both None by default
+        # (disabled). The worker's primary contract is still the
+        # webhook + writer pair; these are pure additive notifications.
+        self._telegram = telegram_notifier
+        self._ntfy = ntfy_notifier
 
     def run_once(self) -> WorkerRunResult:
         """One full tick. Never raises — errors are captured in the result."""
@@ -172,6 +179,47 @@ class Worker:
                     )
                 )
 
+            # Secondary delivery channels — Telegram and/or NTFY push
+            # for the most interesting opportunities. Each fires
+            # independently of the others: any one failing must NOT
+            # roll back the webhook delivery, the DB row, or sibling
+            # notifiers. Both notifiers swallow their own exceptions
+            # and return a result object, so the try/except below is
+            # purely defensive against a pathological stub in tests.
+            if self._telegram is not None:
+                try:
+                    tg_result = self._telegram.send_opportunity(opp)
+                    logger.info(
+                        "worker_telegram_done",
+                        extra={
+                            "opportunity_id": opp.opportunity_id,
+                            "status": tg_result.status,
+                            "reason": tg_result.reason,
+                        },
+                    )
+                except Exception:  # noqa: BLE001 — never crash a tick
+                    logger.exception(
+                        "worker_telegram_unexpected_error",
+                        extra={"opportunity_id": opp.opportunity_id},
+                    )
+
+            if self._ntfy is not None:
+                try:
+                    ntfy_result = self._ntfy.send_opportunity(opp)
+                    logger.info(
+                        "worker_ntfy_done",
+                        extra={
+                            "opportunity_id": opp.opportunity_id,
+                            "status": ntfy_result.status,
+                            "reason": ntfy_result.reason,
+                        },
+                    )
+                except Exception:  # noqa: BLE001 — never crash a tick
+                    logger.exception(
+                        "worker_ntfy_unexpected_error",
+                        extra={"opportunity_id": opp.opportunity_id},
+                    )
+
         result = WorkerRunResult(
             listings_fetched=len(all_listings),
             per_source_counts=per_source_counts,
@@ -241,8 +289,22 @@ def _build_default_worker() -> Worker:
     # Imports are local so unit tests don't need feedparser/httpx etc.
     from aace_execution.connectors.bensbargains import BensBargainsConnector
     from aace_execution.connectors.dealnews import DealNewsConnector
+    from aace_execution.connectors.nine_to_five_toys import (
+        NineToFiveToysConnector,
+    )
     from aace_execution.connectors.slickdeals import SlickdealsConnector
     from aace_execution.connectors.techbargains import TechBargainsConnector
+    # NOTE: WootConnector and DealsPlusConnector are intentionally NOT in
+    # the default connector list as of 2026-06-10. Their upstream RSS
+    # feeds returned hard failures in production:
+    #   * Woot:      HTTP 404 at https://www.woot.com/feed/rss
+    #                Amazon-owned Woot appears to have deprecated public
+    #                RSS. No obvious replacement endpoint.
+    #   * DealsPlus: DNS failure on www.dealsplus.com — domain is gone,
+    #                site is defunct.
+    # The connector source files + tests are kept in-tree so they can
+    # be re-enabled instantly if a working RSS endpoint is ever found.
+    # To revive: add the import here and add the constructor below.
 
     webhook_url = os.environ.get("AGENT_WEBHOOK_URL")
     webhook_secret = os.environ.get("AGENT_WEBHOOK_SECRET")
@@ -273,6 +335,9 @@ def _build_default_worker() -> Worker:
         DealNewsConnector(),
         BensBargainsConnector(),
         TechBargainsConnector(),
+        NineToFiveToysConnector(),
+        # WootConnector(),       # disabled: upstream RSS returns 404
+        # DealsPlusConnector(),  # disabled: upstream domain DNS-dead
     ]
 
     similarity_threshold = float(
@@ -295,12 +360,44 @@ def _build_default_worker() -> Worker:
                 extra={"error": f"{type(exc).__name__}: {exc}"},
             )
 
+    # Optional Telegram notifier. Auto-disables if env vars are absent
+    # so local dev environments don't need to know about it.
+    telegram_notifier = None
+    try:
+        from aace_execution.integrations.telegram_notifier import (
+            TelegramNotifier,
+        )
+        telegram_notifier = TelegramNotifier.from_environment()
+        if telegram_notifier is not None:
+            logger.info("worker_telegram_enabled")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "worker_telegram_init_failed",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+
+    # Optional NTFY notifier. Same gentle-failure shape as Telegram —
+    # absent NTFY_TOPIC in env means "this environment doesn't use it."
+    ntfy_notifier = None
+    try:
+        from aace_execution.integrations.ntfy_notifier import NtfyNotifier
+        ntfy_notifier = NtfyNotifier.from_environment()
+        if ntfy_notifier is not None:
+            logger.info("worker_ntfy_enabled")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "worker_ntfy_init_failed",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+
     return Worker(
         connectors=connectors,
         scorer=scorer,
         webhook_client=webhook_client,
         similarity_threshold=similarity_threshold,
         opportunity_writer=opportunity_writer,
+        telegram_notifier=telegram_notifier,
+        ntfy_notifier=ntfy_notifier,
     )
 
 

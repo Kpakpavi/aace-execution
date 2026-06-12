@@ -761,17 +761,71 @@ _WORKER_OPPORTUNITY_COLUMNS = (
 )
 
 
+# Process-wide resale-comps client. Routed: Amazon -> Keepa (real if
+# KEEPA_API_KEY is set; mock otherwise), other platforms -> SerpAPI
+# (real if SERPAPI_KEY is set; mock otherwise). The router falls back
+# to the mock cleanly if either client fails or isn't configured —
+# so missing or revoked keys never break the dashboard.
+from aace_execution.connectors.resale_comps import (
+    KeepaClient,
+    RoutedResaleCompsClient,
+    SerpApiClient,
+)
+
+
+def _build_resale_comps_client() -> RoutedResaleCompsClient:
+    """Build the process-wide resale-comps router from env config.
+
+    Cred-free / dev environment: returns a router with mock fallback
+    only (matches yesterday's Sprint 2 scaffolding behaviour).
+    """
+    keepa = None
+    keepa_key = os.environ.get("KEEPA_API_KEY")
+    if keepa_key:
+        try:
+            keepa = KeepaClient(api_key=keepa_key)
+            logger.info("keepa_client_enabled")
+        except Exception:  # noqa: BLE001
+            logger.exception("keepa_client_init_failed")
+            keepa = None
+
+    serpapi = None
+    serpapi_key = os.environ.get("SERPAPI_KEY")
+    if serpapi_key:
+        try:
+            serpapi = SerpApiClient(api_key=serpapi_key)
+            logger.info("serpapi_client_enabled")
+        except Exception:  # noqa: BLE001
+            logger.exception("serpapi_client_init_failed")
+            serpapi = None
+
+    return RoutedResaleCompsClient(keepa=keepa, serpapi=serpapi)
+
+
+_RESALE_COMPS_CLIENT = _build_resale_comps_client()
+
+
 @app.get(
     "/worker-opportunities",
     summary="Live worker opportunities (v0.1.0 worker output)",
     description=(
         "List the most recent opportunities the scheduled worker scored "
-        "and shipped to the AI agent. Newest first."
+        "and shipped to the AI agent. Newest first. When ``platform`` is "
+        "supplied, each row is enriched with a resale-comp lookup "
+        "(``resale_avg``, ``resale_source``, ``resale_confidence``) for "
+        "that resale platform."
     ),
 )
 def list_worker_opportunities(
     limit: int = Query(50, ge=1, le=500),
     min_score: float | None = Query(None),
+    platform: str | None = Query(
+        None,
+        description=(
+            "Resale platform to compute comps for (e.g. 'Amazon', 'eBay'). "
+            "When omitted, comp fields are not populated."
+        ),
+    ),
 ) -> list[dict]:
     try:
         sql = (
@@ -810,6 +864,38 @@ def list_worker_opportunities(
                     record[field] = float(value)
             if record["detected_at"] is not None:
                 record["detected_at"] = record["detected_at"].isoformat()
+
+            # Resale comp enrichment — only when caller asked for one.
+            # Errors here MUST NOT break the listing endpoint: we log and
+            # leave the comp fields blank so the dashboard falls back to
+            # the legacy max_price proxy.
+            if platform:
+                try:
+                    comp = _RESALE_COMPS_CLIENT.lookup(
+                        product_key=record["product_key"],
+                        platform=platform,
+                        price_hint=record.get("min_price"),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "resale_comps_lookup_failed",
+                        extra={
+                            "opportunity_id": record.get("opportunity_id"),
+                            "platform": platform,
+                        },
+                    )
+                    comp = None
+                if comp is not None:
+                    record["resale_avg"] = comp.sold_avg
+                    record["resale_count"] = comp.sold_count
+                    record["resale_source"] = comp.source
+                    record["resale_confidence"] = comp.confidence
+                else:
+                    record["resale_avg"] = None
+                    record["resale_count"] = None
+                    record["resale_source"] = None
+                    record["resale_confidence"] = None
+
             records.append(record)
         return records
     except HTTPException:
