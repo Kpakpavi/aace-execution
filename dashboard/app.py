@@ -210,6 +210,15 @@ else:
         fee, net, roi = calc_profit(
             buy_price, resale_price, selected_platform, shipping_estimate
         )
+        # Detection count: how many times the worker has re-found this
+        # same deal across ticks. High values mean it's persistent —
+        # worth acting on. The API returns the latest snapshot per
+        # opportunity_id so each row here is already deduped.
+        detections = opp.get("detections")
+        try:
+            detections_n = int(detections) if detections is not None else 1
+        except (TypeError, ValueError):
+            detections_n = 1
         rows.append({
             "Product": opp.get("product_key", ""),
             "Sources": opp.get("sources", ""),
@@ -220,6 +229,7 @@ else:
             "Ship $": round(shipping_estimate, 2),
             "Net Profit $": net,
             "ROI %": roi,
+            "Seen": detections_n,
             "Detected": format_timestamp(opp.get("detected_at")),
             "Webhook": opp.get("delivery_status", ""),
         })
@@ -345,6 +355,16 @@ else:
             ),
             "Fee $": st.column_config.NumberColumn("Fee $", format="$%.2f"),
             "Ship $": st.column_config.NumberColumn("Ship $", format="$%.2f"),
+            "Seen": st.column_config.NumberColumn(
+                "Seen",
+                format="%d×",
+                help=(
+                    "How many times the worker has re-found this same "
+                    "deal across ticks. High values mean the deal is "
+                    "persistent — worth acting on. Each row here is "
+                    "deduped to one entry per opportunity."
+                ),
+            ),
         },
     )
 

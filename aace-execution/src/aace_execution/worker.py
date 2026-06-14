@@ -96,6 +96,7 @@ class Worker:
         opportunity_writer: Any = None,
         telegram_notifier: Any = None,
         ntfy_notifier: Any = None,
+        phone_alert: Any = None,
     ) -> None:
         if not connectors:
             raise ValueError("at least one connector is required")
@@ -104,11 +105,13 @@ class Worker:
         self._webhook = webhook_client
         self._similarity_threshold = similarity_threshold
         self._opportunity_writer = opportunity_writer
-        # Optional secondary delivery channels. Both None by default
+        # Optional secondary delivery channels. All None by default
         # (disabled). The worker's primary contract is still the
         # webhook + writer pair; these are pure additive notifications.
+        # Ordered roughly by priority: phone (urgent), telegram, ntfy.
         self._telegram = telegram_notifier
         self._ntfy = ntfy_notifier
+        self._phone_alert = phone_alert
 
     def run_once(self) -> WorkerRunResult:
         """One full tick. Never raises — errors are captured in the result."""
@@ -179,14 +182,27 @@ class Worker:
                     )
                 )
 
-            # Secondary delivery channels — Telegram and/or NTFY push
-            # for the most interesting opportunities. Each fires
-            # independently of the others: any one failing must NOT
-            # roll back the webhook delivery, the DB row, or sibling
-            # notifiers. Both notifiers swallow their own exceptions
-            # and return a result object, so the try/except below is
-            # purely defensive against a pathological stub in tests.
-            if self._telegram is not None:
+            # Secondary delivery channels — Telegram, NTFY, phone alert.
+            # Each fires independently; any one failing must NOT roll
+            # back the webhook, the DB row, or its siblings.
+            #
+            # Dedup contract: if the webhook says "deduped" (we already
+            # shipped this opportunity_id within the dedup window), we
+            # skip ALL secondary channels too. The agent already got
+            # the data; ringing the human's phone again would be noise.
+            # This makes the webhook's dedup store the single source of
+            # truth across every alerting surface.
+            webhook_status = (
+                delivery_results[-1].status if delivery_results else None
+            )
+            secondary_skip = webhook_status == "deduped"
+            if secondary_skip:
+                logger.info(
+                    "worker_secondary_channels_skipped_dedup",
+                    extra={"opportunity_id": opp.opportunity_id},
+                )
+
+            if not secondary_skip and self._telegram is not None:
                 try:
                     tg_result = self._telegram.send_opportunity(opp)
                     logger.info(
@@ -203,7 +219,7 @@ class Worker:
                         extra={"opportunity_id": opp.opportunity_id},
                     )
 
-            if self._ntfy is not None:
+            if not secondary_skip and self._ntfy is not None:
                 try:
                     ntfy_result = self._ntfy.send_opportunity(opp)
                     logger.info(
@@ -217,6 +233,26 @@ class Worker:
                 except Exception:  # noqa: BLE001 — never crash a tick
                     logger.exception(
                         "worker_ntfy_unexpected_error",
+                        extra={"opportunity_id": opp.opportunity_id},
+                    )
+
+            # Tier-1 channel — fires only for the most valuable
+            # opportunities (default: net >= $50 AND ROI >= 20%).
+            # Hits a Zapier webhook that triggers an AI phone call.
+            if not secondary_skip and self._phone_alert is not None:
+                try:
+                    phone_result = self._phone_alert.send_alert(opp)
+                    logger.info(
+                        "worker_phone_alert_done",
+                        extra={
+                            "opportunity_id": opp.opportunity_id,
+                            "status": phone_result.status,
+                            "reason": phone_result.reason,
+                        },
+                    )
+                except Exception:  # noqa: BLE001 — never crash a tick
+                    logger.exception(
+                        "worker_phone_alert_unexpected_error",
                         extra={"opportunity_id": opp.opportunity_id},
                     )
 
@@ -390,6 +426,22 @@ def _build_default_worker() -> Worker:
             extra={"error": f"{type(exc).__name__}: {exc}"},
         )
 
+    # Optional phone alert (Tier-1, Zapier → Synthflow). Absent
+    # ZAPIER_WEBHOOK_URL disables it.
+    phone_alert = None
+    try:
+        from aace_execution.integrations.phone_alert_webhook import (
+            PhoneAlertWebhook,
+        )
+        phone_alert = PhoneAlertWebhook.from_environment()
+        if phone_alert is not None:
+            logger.info("worker_phone_alert_enabled")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "worker_phone_alert_init_failed",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+
     return Worker(
         connectors=connectors,
         scorer=scorer,
@@ -398,7 +450,79 @@ def _build_default_worker() -> Worker:
         opportunity_writer=opportunity_writer,
         telegram_notifier=telegram_notifier,
         ntfy_notifier=ntfy_notifier,
+        phone_alert=phone_alert,
     )
+
+
+def _run_daily_digest(digest, lookback_hours: int) -> None:
+    """Scheduled callable — query DB for recent opportunities + send email.
+
+    Lives in worker.py rather than email_digest.py to keep that module
+    free of any DB coupling (so it's pure & easy to test). Never raises
+    into the scheduler — apscheduler would otherwise log and continue
+    anyway, but explicit is better than implicit.
+    """
+    try:
+        from aace_execution.persistence.db import connect
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "email_digest_db_unavailable",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+        return
+
+    rows: list[dict] = []
+    try:
+        connection = connect()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT opportunity_id, product_key, sources, source_count,
+                           min_price, max_price, absolute_spread, percent_spread,
+                           score, delivery_status, detected_at
+                    FROM worker_opportunities
+                    WHERE detected_at > NOW() - (%s || ' hours')::interval
+                    ORDER BY detected_at DESC
+                    """,
+                    (str(lookback_hours),),
+                )
+                column_names = [c.name for c in cursor.description]
+                for row in cursor.fetchall():
+                    rows.append(dict(zip(column_names, row)))
+        finally:
+            connection.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "email_digest_db_query_failed",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+        return
+
+    # Cast Decimal -> float so the digest's filter math doesn't choke.
+    for r in rows:
+        for k in ("min_price", "max_price", "absolute_spread",
+                  "percent_spread", "score"):
+            v = r.get(k)
+            if v is not None and not isinstance(v, (int, float)):
+                try:
+                    r[k] = float(v)
+                except (TypeError, ValueError):
+                    r[k] = 0.0
+
+    try:
+        result = digest.send_digest(rows)
+        logger.info(
+            "email_digest_run_complete",
+            extra={
+                "status": result.status,
+                "deal_count": result.deal_count,
+                "reason": result.reason,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        # send_digest is contractually no-raise; this is defensive.
+        logger.exception("email_digest_unexpected_error")
 
 
 def main() -> None:
@@ -435,6 +559,45 @@ def main() -> None:
         max_instances=1,
         coalesce=True,
     )
+
+    # Optional second scheduled job: daily email digest. Auto-disables
+    # when EMAIL_SMTP_HOST/USERNAME/PASSWORD/TO are absent from env.
+    try:
+        from aace_execution.integrations.email_digest import EmailDigest
+        email_digest = EmailDigest.from_environment()
+        if email_digest is not None:
+            digest_hour = int(
+                os.environ.get("EMAIL_DIGEST_HOUR_UTC", "7").strip() or "7"
+            )
+            if not (0 <= digest_hour <= 23):
+                logger.warning(
+                    "email_digest_hour_out_of_range",
+                    extra={"value": digest_hour, "default": 7},
+                )
+                digest_hour = 7
+            scheduler.add_job(
+                _run_daily_digest,
+                kwargs={
+                    "digest": email_digest,
+                    "lookback_hours": email_digest._lookback_hours,
+                },
+                trigger="cron",
+                hour=digest_hour,
+                minute=0,
+                id="aace_email_digest",
+                name="AACE daily email digest",
+                max_instances=1,
+                coalesce=True,
+            )
+            logger.info(
+                "email_digest_scheduled",
+                extra={"hour_utc": digest_hour},
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "email_digest_init_failed",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
 
     def _graceful_shutdown(signum, _frame):
         logger.info("worker_received_signal", extra={"signum": signum})

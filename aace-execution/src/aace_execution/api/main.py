@@ -763,6 +763,7 @@ _WORKER_OPPORTUNITY_COLUMNS = (
     "score",
     "delivery_status",
     "detected_at",
+    "detections",  # how many times the worker has re-found this same deal
 )
 
 
@@ -830,17 +831,42 @@ def list_worker_opportunities(
     ),
 ) -> list[dict]:
     try:
-        sql = (
+        # Dedup-by-opportunity_id query:
+        #
+        # Every worker tick that re-finds the same deal inserts a fresh
+        # row into worker_opportunities (different detected_at, same
+        # opportunity_id). The dashboard wants ONE row per deal — the
+        # latest snapshot, plus a count of how many times it's been
+        # seen ("detections"). We use a CTE so the detection count is
+        # computed once and only the most recent row per opportunity_id
+        # survives to the result set.
+        #
+        # ROW_NUMBER() OVER (PARTITION BY opportunity_id ORDER BY
+        # detected_at DESC) ranks rows within each opportunity group by
+        # recency; rn=1 picks the freshest. COUNT(*) OVER (...) tags
+        # every row with its group size before the filter.
+        sql_inner = (
             "SELECT opportunity_id, product_key, sources, source_count, "
             "min_price, max_price, absolute_spread, percent_spread, "
-            "score, delivery_status, detected_at "
+            "score, delivery_status, detected_at, "
+            "ROW_NUMBER() OVER ("
+            "  PARTITION BY opportunity_id ORDER BY detected_at DESC"
+            ") AS rn, "
+            "COUNT(*) OVER (PARTITION BY opportunity_id) AS detections "
             "FROM worker_opportunities"
         )
         params: list[object] = []
         if min_score is not None:
-            sql += " WHERE score >= %s"
+            sql_inner += " WHERE score >= %s"
             params.append(min_score)
-        sql += " ORDER BY detected_at DESC LIMIT %s"
+        sql = (
+            f"SELECT opportunity_id, product_key, sources, source_count, "
+            f"min_price, max_price, absolute_spread, percent_spread, "
+            f"score, delivery_status, detected_at, detections "
+            f"FROM ({sql_inner}) ranked "
+            f"WHERE rn = 1 "
+            f"ORDER BY detected_at DESC LIMIT %s"
+        )
         params.append(limit)
 
         connection = connect()
