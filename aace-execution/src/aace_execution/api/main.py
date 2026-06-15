@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from aace_execution.api.models import RunPipelineRequest
 from aace_execution.api.responses import RunPipelineResponse
@@ -18,6 +19,12 @@ from aace_execution.observability import init_sentry
 
 from aace_execution.persistence.db import connect
 from aace_execution.persistence.postgres_writer import PostgresWriter
+from aace_execution.persistence.watchlist_repository import (
+    WatchlistEntry,
+    WatchlistError,
+    WatchlistRepository,
+    match_keywords,
+)
 from aace_execution.pipeline.pipeline_runner import PipelineRunner
 from aace_execution.validators.input_validator import (
     InputValidator,
@@ -893,6 +900,16 @@ def list_worker_opportunities(
             if record["detected_at"] is not None:
                 record["detected_at"] = record["detected_at"].isoformat()
 
+            # Watchlist enrichment — flag which (if any) active
+            # watchlist keywords appear in the product_key. Computed
+            # once per request from a fresh repo snapshot so the
+            # dashboard never sees stale flags after the operator
+            # toggles an entry. Failure here must not break the
+            # listing endpoint.
+            record["watchlist_matches"] = _match_against_active_watchlist(
+                record.get("product_key", "")
+            )
+
             # Resale comp enrichment — only when caller asked for one.
             # Errors here MUST NOT break the listing endpoint: we log and
             # leave the comp fields blank so the dashboard falls back to
@@ -936,6 +953,204 @@ def list_worker_opportunities(
                 "error": "internal_error",
                 "detail": "Worker opportunities lookup failed",
             },
+        )
+
+
+def _match_against_active_watchlist(product_key: str) -> list[str]:
+    """Return active watchlist keywords matching ``product_key``.
+
+    Catches all errors so a watchlist outage never breaks listing
+    endpoints — falls back to an empty list. The connection lifetime
+    is per-call (request-scoped) to avoid sharing a transaction with
+    callers that might be doing their own commits.
+    """
+    try:
+        connection = connect()
+        try:
+            repo = WatchlistRepository(connection)
+            active = repo.list_entries(active_only=True)
+        finally:
+            connection.close()
+        return match_keywords(product_key, [e.keyword for e in active])
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "watchlist_match_failed",
+            extra={"product_key": product_key},
+        )
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Watchlist CRUD
+# ---------------------------------------------------------------------------
+
+
+class _WatchlistCreate(BaseModel):
+    """POST /watchlist body."""
+
+    keyword: str = Field(..., description="Substring to hunt for in product titles")
+    description: str = Field("", description="Optional notes")
+
+
+class _WatchlistPatch(BaseModel):
+    """PATCH /watchlist/{id} body. Every field optional."""
+
+    keyword: str | None = None
+    description: str | None = None
+    active: bool | None = None
+
+
+def _entry_to_dict(entry: WatchlistEntry) -> dict:
+    """Serialize a :class:`WatchlistEntry` for HTTP responses."""
+    return {
+        "id": entry.id,
+        "keyword": entry.keyword,
+        "description": entry.description,
+        "active": entry.active,
+        "created_at": entry.created_at.isoformat() if entry.created_at else None,
+        "updated_at": entry.updated_at.isoformat() if entry.updated_at else None,
+    }
+
+
+@app.get(
+    "/watchlist",
+    summary="List watchlist entries",
+    description=(
+        "Return every operator watchlist entry, newest first. "
+        "Use ``active_only=true`` to hide soft-deleted entries."
+    ),
+)
+def list_watchlist(
+    active_only: bool = Query(False, description="Hide soft-deleted entries"),
+) -> list[dict]:
+    try:
+        connection = connect()
+        try:
+            repo = WatchlistRepository(connection)
+            entries = repo.list_entries(active_only=active_only)
+        finally:
+            connection.close()
+        return [_entry_to_dict(e) for e in entries]
+    except Exception:
+        logger.exception("list_watchlist_internal_error")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "detail": "Watchlist lookup failed"},
+        )
+
+
+@app.post(
+    "/watchlist",
+    status_code=201,
+    summary="Add a watchlist entry",
+    description=(
+        "Add a new keyword to the operator watchlist. Returns the "
+        "created row. 409 if the keyword (case-insensitive) already "
+        "exists."
+    ),
+)
+def create_watchlist_entry(body: _WatchlistCreate) -> dict:
+    try:
+        connection = connect()
+        try:
+            repo = WatchlistRepository(connection)
+            entry = repo.add_entry(
+                keyword=body.keyword,
+                description=body.description,
+            )
+        finally:
+            connection.close()
+        return _entry_to_dict(entry)
+    except WatchlistError as exc:
+        # Caller error — map to 4xx so the dashboard can show a useful
+        # message rather than a generic 500.
+        status = 409 if "already" in str(exc) else 400
+        raise HTTPException(
+            status_code=status,
+            detail={"error": "watchlist_error", "detail": str(exc)},
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("create_watchlist_internal_error")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "detail": "Watchlist insert failed"},
+        )
+
+
+@app.patch(
+    "/watchlist/{entry_id}",
+    summary="Update a watchlist entry",
+    description=(
+        "Partial update — any omitted field is left unchanged. "
+        "Returns the updated row, or 404 if no such id."
+    ),
+)
+def update_watchlist_entry(entry_id: int, body: _WatchlistPatch) -> dict:
+    try:
+        connection = connect()
+        try:
+            repo = WatchlistRepository(connection)
+            entry = repo.update_entry(
+                entry_id,
+                keyword=body.keyword,
+                description=body.description,
+                active=body.active,
+            )
+        finally:
+            connection.close()
+        if entry is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "not_found", "detail": f"watchlist entry {entry_id} not found"},
+            )
+        return _entry_to_dict(entry)
+    except WatchlistError as exc:
+        status = 409 if "conflict" in str(exc).lower() else 400
+        raise HTTPException(
+            status_code=status,
+            detail={"error": "watchlist_error", "detail": str(exc)},
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("update_watchlist_internal_error")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "detail": "Watchlist update failed"},
+        )
+
+
+@app.delete(
+    "/watchlist/{entry_id}",
+    status_code=204,
+    summary="Hard-delete a watchlist entry",
+    description=(
+        "Remove the entry permanently. For audit-friendly removal "
+        "prefer PATCH with ``active=false``."
+    ),
+)
+def delete_watchlist_entry(entry_id: int) -> None:
+    try:
+        connection = connect()
+        try:
+            repo = WatchlistRepository(connection)
+            removed = repo.delete_entry(entry_id)
+        finally:
+            connection.close()
+        if not removed:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "not_found", "detail": f"watchlist entry {entry_id} not found"},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("delete_watchlist_internal_error")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "internal_error", "detail": "Watchlist delete failed"},
         )
 
 

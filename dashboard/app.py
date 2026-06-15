@@ -123,6 +123,83 @@ def fetch_worker_opportunities(limit: int = 25, platform: str | None = None):
 
 
 # ---------------------------------------------------------------------------
+# Watchlist API helpers — thin wrappers over the CRUD endpoints
+# ---------------------------------------------------------------------------
+
+
+def _api_headers() -> dict[str, str]:
+    return {"X-API-Key": os.environ.get("AACE_API_KEY", "")}
+
+
+def fetch_watchlist(active_only: bool = False):
+    """GET /watchlist → (list, error_string_or_None)."""
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/watchlist",
+            params={"active_only": "true" if active_only else "false"},
+            headers=_api_headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json(), None
+    except requests.RequestException as exc:
+        return None, str(exc)
+
+
+def create_watchlist_entry(keyword: str, description: str = ""):
+    """POST /watchlist → (entry, error_string_or_None)."""
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/watchlist",
+            json={"keyword": keyword, "description": description},
+            headers=_api_headers(),
+            timeout=10,
+        )
+        if response.status_code in (400, 409):
+            # User-facing API error — show the server's message verbatim.
+            body = response.json()
+            return None, body.get("detail", "Validation error")
+        response.raise_for_status()
+        return response.json(), None
+    except requests.RequestException as exc:
+        return None, str(exc)
+
+
+def patch_watchlist_entry(entry_id: int, **fields):
+    """PATCH /watchlist/{id} with only the fields the caller passed."""
+    try:
+        response = requests.patch(
+            f"{API_BASE_URL}/watchlist/{entry_id}",
+            json=fields,
+            headers=_api_headers(),
+            timeout=10,
+        )
+        if response.status_code in (400, 404, 409):
+            body = response.json()
+            return None, body.get("detail", "Update failed")
+        response.raise_for_status()
+        return response.json(), None
+    except requests.RequestException as exc:
+        return None, str(exc)
+
+
+def delete_watchlist_entry(entry_id: int):
+    """DELETE /watchlist/{id} → (True, None) on success."""
+    try:
+        response = requests.delete(
+            f"{API_BASE_URL}/watchlist/{entry_id}",
+            headers=_api_headers(),
+            timeout=10,
+        )
+        if response.status_code == 404:
+            return False, "Entry no longer exists"
+        response.raise_for_status()
+        return True, None
+    except requests.RequestException as exc:
+        return False, str(exc)
+
+
+# ---------------------------------------------------------------------------
 # Resale platform fees + shipping estimate (used by Best Profit panel below)
 # ---------------------------------------------------------------------------
 
@@ -397,6 +474,166 @@ else:
             help="Exports exactly the rows currently visible above",
         )
 st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Watchlist Matches — opportunities that match a starred keyword
+# ---------------------------------------------------------------------------
+# This panel is operator-driven: keywords come from the operator's
+# watchlist (managed below). Any worker_opportunity whose product_key
+# contains an active keyword shows up here, no matter how the Best
+# Profit filters above are set.
+
+st.header("Watchlist Matches")
+st.caption(
+    "Opportunities matching a keyword you're actively hunting. "
+    "Add or remove keywords in the Manage Watchlist section below — "
+    "matches refresh on the next page reload."
+)
+
+# Reuse the same worker_opps fetched above. If the earlier fetch
+# failed (worker_err), gracefully degrade rather than re-fetching.
+if not worker_err and worker_opps:
+    watchlist_rows = []
+    for opp in worker_opps:
+        matches = opp.get("watchlist_matches") or []
+        if not matches:
+            continue
+        buy_price = float(opp.get("min_price") or 0)
+        resale_avg = opp.get("resale_avg")
+        if resale_avg is not None:
+            resale_price = float(resale_avg)
+        else:
+            resale_price = float(opp.get("max_price") or 0)
+        fee, net, roi = calc_profit(
+            buy_price, resale_price, selected_platform, shipping_estimate
+        )
+        watchlist_rows.append({
+            "Matched": ", ".join(matches),
+            "Product": opp.get("product_key", ""),
+            "Sources": opp.get("sources", ""),
+            "Buy $": round(buy_price, 2),
+            "Resale $": round(resale_price, 2),
+            "Net Profit $": net,
+            "ROI %": roi,
+            "Seen": int(opp.get("detections") or 1),
+            "Detected": format_timestamp(opp.get("detected_at")),
+        })
+    watchlist_rows.sort(key=lambda r: r["Net Profit $"], reverse=True)
+    if watchlist_rows:
+        profitable = sum(1 for r in watchlist_rows if r["Net Profit $"] > 0)
+        st.success(
+            f"{len(watchlist_rows)} matches · {profitable} profitable on "
+            f"{selected_platform} after fees + ${shipping_estimate:.0f} shipping"
+        )
+        st.dataframe(
+            watchlist_rows,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Matched": st.column_config.TextColumn(
+                    "Matched",
+                    help="Which watchlist keyword(s) the product title hit",
+                ),
+                "Net Profit $": st.column_config.NumberColumn(
+                    "Net Profit $", format="$%.2f",
+                ),
+                "ROI %": st.column_config.NumberColumn(
+                    "ROI %", format="%.1f%%",
+                ),
+                "Buy $": st.column_config.NumberColumn("Buy $", format="$%.2f"),
+                "Resale $": st.column_config.NumberColumn("Resale $", format="$%.2f"),
+                "Seen": st.column_config.NumberColumn("Seen", format="%d×"),
+            },
+        )
+    else:
+        st.info(
+            "No live opportunities match any of your watchlist keywords yet. "
+            "Add keywords below and they'll show up here as AACE finds them."
+        )
+else:
+    st.info("Worker opportunities unavailable — watchlist matches paused.")
+st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Manage Watchlist — CRUD UI for the operator's keyword list
+# ---------------------------------------------------------------------------
+
+st.header("Manage Watchlist")
+st.caption(
+    "Add products you're hunting (e.g. \"apple watch series 11\", \"ps5\"). "
+    "Matching is case-insensitive substring on the product title. "
+    "Soft-disable an entry with the toggle to pause matching without "
+    "deleting it."
+)
+
+# Add new keyword
+with st.form("add_watchlist_form", clear_on_submit=True):
+    add_col1, add_col2, add_col3 = st.columns([2, 3, 1])
+    with add_col1:
+        new_keyword = st.text_input(
+            "Keyword",
+            placeholder="e.g. apple watch series 11",
+        )
+    with add_col2:
+        new_description = st.text_input(
+            "Notes (optional)",
+            placeholder="What you're hunting and why",
+        )
+    with add_col3:
+        st.write("")  # vertical alignment with the inputs
+        submitted = st.form_submit_button("Add", type="primary")
+    if submitted and new_keyword.strip():
+        entry, err = create_watchlist_entry(
+            keyword=new_keyword, description=new_description
+        )
+        if err:
+            st.error(f"Could not add: {err}")
+        else:
+            st.success(f"Added: {entry['keyword']}")
+            st.rerun()
+
+# Current entries
+entries, err = fetch_watchlist(active_only=False)
+if err:
+    st.error(f"Failed to load watchlist: {err}")
+elif not entries:
+    st.info("No watchlist entries yet. Add one above to start hunting.")
+else:
+    st.write(f"**{len(entries)} entries** ({sum(1 for e in entries if e['active'])} active)")
+    for entry in entries:
+        cols = st.columns([3, 4, 1, 1])
+        with cols[0]:
+            label = entry["keyword"]
+            if not entry["active"]:
+                label = f"~~{label}~~ (paused)"
+            st.markdown(f"**{label}**")
+        with cols[1]:
+            st.caption(entry.get("description") or "_no notes_")
+        with cols[2]:
+            new_active = st.toggle(
+                "Active",
+                value=entry["active"],
+                key=f"toggle_{entry['id']}",
+                label_visibility="collapsed",
+            )
+            if new_active != entry["active"]:
+                _, err = patch_watchlist_entry(entry["id"], active=new_active)
+                if err:
+                    st.error(err)
+                else:
+                    st.rerun()
+        with cols[3]:
+            if st.button("Delete", key=f"delete_{entry['id']}"):
+                _, err = delete_watchlist_entry(entry["id"])
+                if err:
+                    st.error(err)
+                else:
+                    st.rerun()
+
+st.divider()
+
 
 # ---------------------------------------------------------------------------
 # Legacy panels (Opportunity Summary, Top Products, Alert Rate, Hot Deals,
